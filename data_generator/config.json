@@ -1,0 +1,8 @@
+{
+  "generation_interval": 2.0,
+  "data_types": [
+    "temperature",
+    "humidity"
+  ],
+  "enable_noise": false
+}

@@ -1,0 +1,54 @@
+{
+  "id": "data_generator",
+  "name": "数据生成器",
+  "version": "1.0.0",
+  "description": "生成模拟传感器数据，包括温度、湿度、GPS位置等信息",
+  "author": "测试开发者",
+  "dependencies": [],
+  "entry": "plugin.py",
+  "updated_at": "2025-01-20",
+  "config_schema": [
+    {
+      "name": "generation_interval",
+      "type": "number",
+      "default": 5.0,
+      "description": "数据生成间隔（秒）",
+      "min": 1.0,
+      "max": 60.0
+    },
+    {
+      "name": "data_types",
+      "type": "array",
+      "default": ["temperature", "humidity", "gps"],
+      "description": "要生成的数据类型",
+      "items": {
+        "type": "string",
+        "enum": ["temperature", "humidity", "gps", "speed", "battery"]
+      }
+    },
+    {
+      "name": "enable_noise",
+      "type": "boolean",
+      "default": true,
+      "description": "是否添加随机噪声"
+    }
+  ],
+  "interfaces": [
+    "get_latest_data",
+    "get_data_history",
+    "start_generation",
+    "stop_generation"
+  ],
+  "events": {
+    "publishes": [
+      "sensor.data_generated",
+      "sensor.temperature_update",
+      "sensor.gps_update",
+      "sensor.battery_low"
+    ],
+    "subscribes": [
+      "system.startup",
+      "system.shutdown"
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "analysis_window": 60,
+  "alert_thresholds": {
+    "temperature_high": 30.0,
+    "temperature_low": 5.0,
+    "humidity_high": 85.0,
+    "humidity_low": 35.0,
+    "battery_low": 20.0
+  },
+  "enable_trending": true,
+  "statistical_methods": ["mean", "std", "min", "max", "percentile"]
+}

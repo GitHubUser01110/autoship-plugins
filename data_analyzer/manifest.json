@@ -1,0 +1,68 @@
+{
+  "id": "data_analyzer",
+  "name": "数据分析器",
+  "version": "1.0.0",
+  "description": "分析传感器数据，计算统计信息、检测异常和生成报告",
+  "author": "测试开发者",
+  "dependencies": ["data_generator"],
+  "entry": "plugin.py",
+  "updated_at": "2024-01-20",
+  "config_schema": [
+    {
+      "name": "analysis_window",
+      "type": "number",
+      "default": 60,
+      "description": "分析时间窗口（秒）",
+      "min": 10,
+      "max": 3600
+    },
+    {
+      "name": "alert_thresholds",
+      "type": "object",
+      "default": {
+        "temperature_high": 35.0,
+        "temperature_low": 0.0,
+        "humidity_high": 90.0,
+        "humidity_low": 30.0,
+        "battery_low": 15.0
+      },
+      "description": "告警阈值配置"
+    },
+    {
+      "name": "enable_trending",
+      "type": "boolean",
+      "default": true,
+      "description": "是否启用趋势分析"
+    },
+    {
+      "name": "statistical_methods",
+      "type": "array",
+      "default": ["mean", "std", "min", "max"],
+      "description": "统计分析方法",
+      "items": {
+        "type": "string",
+        "enum": ["mean", "median", "std", "min", "max", "percentile"]
+      }
+    }
+  ],
+  "interfaces": [
+    "get_analysis_report",
+    "get_statistics",
+    "get_alerts",
+    "analyze_data"
+  ],
+  "events": {
+    "publishes": [
+      "analysis.report_generated",
+      "analysis.alert_triggered",
+      "analysis.anomaly_detected",
+      "analysis.statistics_updated"
+    ],
+    "subscribes": [
+      "sensor.data_generated",
+      "sensor.temperature_update",
+      "sensor.gps_update",
+      "sensor.battery_low"
+    ]
+  }
+}
