@@ -46,10 +46,279 @@
     }
   ],
   "interfaces": [
-    "get_analysis_report",
-    "get_statistics",
-    "get_alerts",
-    "analyze_data"
+    {
+      "name": "get_analysis_report",
+      "description": "生成指定时间窗口内的数据分析报告",
+      "parameters": {
+        "input_data": {
+          "type": "object|number",
+          "required": false,
+          "description": "输入参数，可以是对象或数字",
+          "properties": {
+            "window_seconds": {
+              "type": "number",
+              "description": "分析时间窗口长度（秒），默认60秒",
+              "default": 60
+            }
+          },
+          "alternate": {
+            "type": "number",
+            "description": "直接指定时间窗口长度（秒）"
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "description": "完整的数据分析报告",
+        "properties": {
+          "generated_at": {
+            "type": "number",
+            "description": "报告生成时间戳"
+          },
+          "window_seconds": {
+            "type": "number",
+            "description": "分析时间窗口长度"
+          },
+          "data_count": {
+            "type": "number",
+            "description": "分析的数据点数量"
+          },
+          "statistics": {
+            "type": "object",
+            "description": "各数据类型的统计信息",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "mean": {"type": "number", "description": "平均值"},
+                "median": {"type": "number", "description": "中位数"},
+                "std": {"type": "number", "description": "标准差"},
+                "min": {"type": "number", "description": "最小值"},
+                "max": {"type": "number", "description": "最大值"},
+                "count": {"type": "number", "description": "数据点数量"}
+              }
+            }
+          },
+          "trends": {
+            "type": "object",
+            "description": "趋势分析结果",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "direction": {"type": "string", "enum": ["increasing", "decreasing", "stable"]},
+                "slope": {"type": "number", "description": "趋势斜率"},
+                "confidence": {"type": "string", "description": "置信度"}
+              }
+            }
+          },
+          "alerts": {
+            "type": "array",
+            "description": "触发的告警列表",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {"type": "string", "description": "告警类型"},
+                "value": {"type": "number", "description": "触发值"},
+                "threshold": {"type": "number", "description": "阈值"},
+                "timestamp": {"type": "number", "description": "触发时间"},
+                "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]}
+              }
+            }
+          },
+          "anomalies": {
+            "type": "array",
+            "description": "检测到的异常列表",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {"type": "string", "description": "异常类型"},
+                "value": {"type": "number", "description": "异常值"},
+                "expected_range": {"type": "array", "description": "期望范围"},
+                "deviation": {"type": "number", "description": "偏差值"},
+                "timestamp": {"type": "number", "description": "异常时间"},
+                "detection_method": {"type": "string", "description": "检测方法"}
+              }
+            }
+          },
+          "summary": {
+            "type": "object",
+            "description": "报告摘要",
+            "properties": {
+              "data_quality": {"type": "string", "enum": ["poor", "fair", "good"]},
+              "alert_level": {"type": "string", "enum": ["normal", "medium", "high", "critical"]},
+              "key_insights": {"type": "array", "items": {"type": "string"}},
+              "recommendations": {"type": "array", "items": {"type": "string"}}
+            }
+          },
+          "error": {
+            "type": "string",
+            "description": "错误信息（仅在出错时返回）",
+            "optional": true
+          }
+        }
+      }
+    },
+    {
+      "name": "get_statistics",
+      "description": "获取数据统计信息",
+      "parameters": {
+        "input_data": {
+          "type": "object|string",
+          "required": false,
+          "description": "输入参数，可以是对象或字符串",
+          "properties": {
+            "data_type": {
+              "type": "string",
+              "description": "指定数据类型，如'temperature'、'humidity'等",
+              "optional": true
+            }
+          },
+          "alternate": {
+            "type": "string",
+            "description": "直接指定数据类型名称"
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "description": "统计信息对象",
+        "oneOf": [
+          {
+            "description": "特定数据类型的统计信息（当指定data_type时）",
+            "properties": {
+              "mean": {"type": "number", "description": "平均值"},
+              "median": {"type": "number", "description": "中位数"},
+              "std": {"type": "number", "description": "标准差"},
+              "min": {"type": "number", "description": "最小值"},
+              "max": {"type": "number", "description": "最大值"},
+              "count": {"type": "number", "description": "数据点数量"},
+              "percentile_25": {"type": "number", "description": "25百分位数", "optional": true},
+              "percentile_75": {"type": "number", "description": "75百分位数", "optional": true}
+            }
+          },
+          {
+            "description": "所有数据类型的统计信息（当未指定data_type时）",
+            "additionalProperties": {
+              "type": "object",
+              "description": "各数据类型的统计信息，结构同上"
+            }
+          },
+          {
+            "description": "错误情况",
+            "properties": {
+              "error": {"type": "string", "description": "错误信息"}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "get_alerts",
+      "description": "获取告警信息列表",
+      "parameters": {
+        "input_data": {
+          "type": "object|number",
+          "required": false,
+          "description": "输入参数，可以是对象或数字",
+          "properties": {
+            "limit": {
+              "type": "number",
+              "description": "返回的最大告警数量，默认50",
+              "default": 50
+            }
+          },
+          "alternate": {
+            "type": "number",
+            "description": "直接指定返回的告警数量"
+          }
+        }
+      },
+      "returns": {
+        "type": "array",
+        "description": "告警信息列表，按时间倒序排列",
+        "items": {
+          "type": "object",
+          "description": "单条告警记录",
+          "properties": {
+            "type": {
+              "type": "string",
+              "description": "告警类型",
+              "examples": ["temperature_high", "temperature_low", "humidity_high", "humidity_low", "battery_low", "battery_critical"]
+            },
+            "value": {
+              "type": "number",
+              "description": "触发告警的实际值"
+            },
+            "threshold": {
+              "type": "number",
+              "description": "告警阈值",
+              "optional": true
+            },
+            "timestamp": {
+              "type": "number",
+              "description": "告警触发时间戳"
+            },
+            "severity": {
+              "type": "string",
+              "description": "告警严重程度",
+              "enum": ["low", "medium", "high", "critical"]
+            },
+            "message": {
+              "type": "string",
+              "description": "告警消息",
+              "optional": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "analyze_data",
+      "description": "强制执行一次数据分析",
+      "parameters": {
+        "input_data": {
+          "type": "any",
+          "required": false,
+          "description": "可选的输入参数（当前未使用）"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "description": "分析执行状态信息",
+        "oneOf": [
+          {
+            "description": "成功执行分析",
+            "properties": {
+              "analysis_completed": {
+                "type": "boolean",
+                "description": "分析是否完成",
+                "value": true
+              },
+              "analysis_count": {
+                "type": "number",
+                "description": "总分析次数"
+              },
+              "last_analysis_time": {
+                "type": "number",
+                "description": "最后分析时间戳"
+              },
+              "data_points_analyzed": {
+                "type": "number",
+                "description": "本次分析的数据点数量"
+              }
+            }
+          },
+          {
+            "description": "分析执行失败",
+            "properties": {
+              "error": {
+                "type": "string",
+                "description": "错误信息"
+              }
+            }
+          }
+        ]
+      }
+    }
   ],
   "events": {
     "publishes": [
