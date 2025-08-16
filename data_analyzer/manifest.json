@@ -1,7 +1,7 @@
 {
   "id": "data_analyzer",
   "name": "数据分析器",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "分析传感器数据，计算统计信息、检测异常和生成报告",
   "author": "测试开发者",
   "dependencies": ["data_generator"],
