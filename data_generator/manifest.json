@@ -1,7 +1,7 @@
 {
   "id": "data_generator",
   "name": "数据生成器",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "生成模拟传感器数据，包括温度、湿度、GPS位置等信息",
   "author": "测试开发者",
   "dependencies": [],
