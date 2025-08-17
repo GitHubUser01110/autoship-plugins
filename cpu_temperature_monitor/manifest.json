@@ -1,0 +1,63 @@
+{
+  "id": "cpu_temperature_monitor",
+  "name": "CPU温度监测器",
+  "version": "1.0.0",
+  "description": "实时监测并打印CPU温度信息，支持多个温度传感器",
+  "author": "System Monitor",
+  "entry": "plugin.py",
+  "updated_at": "2024-01-01T00:00:00Z",
+  "dependencies": [],
+  "config_schema": [
+    {
+      "key": "monitor_interval",
+      "type": "number",
+      "default": 5.0,
+      "min": 1.0,
+      "max": 60.0,
+      "description": "温度监测间隔（秒）",
+      "required": false
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "get_current_temperature",
+      "description": "获取当前CPU温度",
+      "input_schema": {},
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "timestamp": {"type": "number"},
+          "temperatures": {"type": "object"},
+          "max_temperature": {"type": "number"},
+          "unit": {"type": "string"}
+        }
+      }
+    },
+    {
+      "name": "set_monitor_interval",
+      "description": "设置监测间隔",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "interval": {"type": "number", "minimum": 1.0, "maximum": 60.0}
+        },
+        "required": ["interval"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "success": {"type": "boolean"},
+          "interval": {"type": "number"},
+          "error": {"type": "string"}
+        }
+      }
+    }
+  ],
+  "events": {
+    "publishes": [
+      "cpu.temperature.high_warning",
+      "cpu.temperature.reading"
+    ],
+    "subscribes": []
+  }
+}
