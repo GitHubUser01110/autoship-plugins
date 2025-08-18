@@ -1,0 +1,8 @@
+{
+  "print_interval": 5.0,
+  "message_prefix": "Hello",
+  "message_suffix": "World!",
+  "show_timestamp": true,
+  "show_config": true,
+  "max_messages": 0
+}

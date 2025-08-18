@@ -1,0 +1,120 @@
+{
+  "id": "helloworld",
+  "name": "HelloWorld 测试插件",
+  "version": "1.0.0",
+  "description": "一个简单的测试插件，定期打印 Hello World 消息和配置信息，用于验证插件系统功能",
+  "author": "Plugin System",
+  "entry": "plugin.py",
+  "updated_at": "2025-01-01T00:00:00Z",
+  "dependencies": [],
+  
+  "config_schema": [
+    {
+      "key": "print_interval",
+      "type": "number",
+      "default": 5.0,
+      "min": 0.1,
+      "max": 3600,
+      "title": "打印间隔",
+      "description": "消息打印间隔时间（秒）",
+      "required": true
+    },
+    {
+      "key": "message_prefix",
+      "type": "string",
+      "default": "Hello",
+      "title": "消息前缀",
+      "description": "Hello World 消息的前缀部分",
+      "required": false
+    },
+    {
+      "key": "message_suffix", 
+      "type": "string",
+      "default": "World!",
+      "title": "消息后缀",
+      "description": "Hello World 消息的后缀部分",
+      "required": false
+    },
+    {
+      "key": "show_timestamp",
+      "type": "boolean",
+      "default": true,
+      "title": "显示时间戳",
+      "description": "是否在消息中显示时间戳",
+      "required": false
+    },
+    {
+      "key": "show_config",
+      "type": "boolean", 
+      "default": true,
+      "title": "显示配置",
+      "description": "是否在消息中显示当前配置信息",
+      "required": false
+    },
+    {
+      "key": "max_messages",
+      "type": "integer",
+      "default": 0,
+      "min": 0,
+      "title": "最大消息数",
+      "description": "最大打印消息数量，0表示无限制",
+      "required": false
+    }
+  ],
+  
+  "interfaces": [
+    {
+      "name": "get_status",
+      "description": "获取插件当前状态信息",
+      "input_schema": {},
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "enabled": {"type": "boolean"},
+          "message_count": {"type": "integer"},
+          "start_time": {"type": "number"},
+          "last_message_time": {"type": "number"},
+          "uptime_seconds": {"type": "number"},
+          "thread_active": {"type": "boolean"},
+          "config": {"type": "object"}
+        }
+      }
+    },
+    {
+      "name": "send_custom_message",
+      "description": "发送自定义消息",
+      "input_schema": {
+        "oneOf": [
+          {"type": "string"},
+          {
+            "type": "object",
+            "properties": {
+              "message": {"type": "string"}
+            }
+          }
+        ]
+      },
+      "output_schema": {
+        "type": "string"
+      }
+    },
+    {
+      "name": "reset_counter",
+      "description": "重置消息计数器",
+      "input_schema": {},
+      "output_schema": {
+        "type": "string"
+      }
+    }
+  ],
+  
+  "events": {
+    "publishes": [
+      "helloworld.enabled",
+      "helloworld.disabled", 
+      "helloworld.config_updated",
+      "helloworld.message_sent"
+    ],
+    "subscribes": []
+  }
+}
