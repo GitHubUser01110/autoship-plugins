@@ -8,7 +8,7 @@ HelloWorld 测试插件
 import time
 import threading
 from typing import Dict, Any, Optional
-from plugin_base import Plugin, Response
+from app.usv.plugin_base import Plugin, Response
 
 
 class HelloWorldPlugin(Plugin):
