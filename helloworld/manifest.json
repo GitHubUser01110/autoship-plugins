@@ -1,7 +1,7 @@
 {
   "id": "helloworld",
   "name": "HelloWorld 测试插件",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "一个简单的测试插件，定期打印 Hello World 消息和配置信息，用于验证插件系统功能",
   "author": "Plugin System",
   "entry": "plugin.py",
