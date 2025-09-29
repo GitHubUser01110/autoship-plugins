@@ -11,8 +11,8 @@
 import time
 import threading
 from typing import Any, Dict, Optional
-from plugin_base import Plugin, Response, PluginState
-from event_bus import EventData, EventPriority
+from app.usv.plugin_base import Plugin, Response, PluginState
+from app.usv.event_bus import EventData, EventPriority
 
 
 class ShipBasicControlPlugin(Plugin):
