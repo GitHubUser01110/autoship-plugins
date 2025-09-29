@@ -1,0 +1,131 @@
+{
+    "id": "ship_basic_control",
+    "name": "船只基础控制插件",
+    "version": "1.0.0",
+    "description": "提供船只基础控制功能，包括速度控制、方向控制、停止和紧急停止等核心功能",
+    "author": "Ship Control Team",
+    "entry": "plugin.py",
+    "updated_at": "2025-09-29T00:00:00Z",
+    "dependencies": [],
+    "config_schema": [
+        {
+            "key": "max_speed",
+            "type": "number",
+            "default": 10.0,
+            "min": 0.1,
+            "max": 50.0,
+            "description": "最大速度 (m/s)",
+            "required": true
+        },
+        {
+            "key": "max_acceleration",
+            "type": "number",
+            "default": 2.0,
+            "min": 0.1,
+            "max": 10.0,
+            "description": "最大加速度 (m/s²)",
+            "required": true
+        },
+        {
+            "key": "max_turn_rate",
+            "type": "number",
+            "default": 30.0,
+            "min": 1.0,
+            "max": 90.0,
+            "description": "最大转向速率 (度/秒)",
+            "required": true
+        },
+        {
+            "key": "emergency_decel",
+            "type": "number",
+            "default": 5.0,
+            "min": 1.0,
+            "max": 20.0,
+            "description": "紧急制动减速度 (m/s²)",
+            "required": true
+        },
+        {
+            "key": "control_interval",
+            "type": "number",
+            "default": 0.1,
+            "min": 0.01,
+            "max": 1.0,
+            "description": "控制周期 (秒)",
+            "required": true
+        }
+    ],
+    "interfaces": [
+        {
+            "name": "get_ship_status",
+            "description": "获取船只当前状态",
+            "input_schema": {},
+            "output_schema": {
+                "speed": "number",
+                "direction": "number",
+                "target_speed": "number",
+                "target_direction": "number",
+                "engine_power": "number",
+                "rudder_angle": "number",
+                "status": "string"
+            }
+        },
+        {
+            "name": "set_speed",
+            "description": "设置目标速度",
+            "input_schema": {
+                "speed": "number"
+            },
+            "output_schema": {
+                "success": "boolean",
+                "message": "string"
+            }
+        },
+        {
+            "name": "set_direction",
+            "description": "设置目标方向",
+            "input_schema": {
+                "direction": "number"
+            },
+            "output_schema": {
+                "success": "boolean",
+                "message": "string"
+            }
+        },
+        {
+            "name": "stop",
+            "description": "停止船只",
+            "input_schema": {},
+            "output_schema": {
+                "success": "boolean",
+                "message": "string"
+            }
+        },
+        {
+            "name": "emergency_stop",
+            "description": "紧急停止船只",
+            "input_schema": {},
+            "output_schema": {
+                "success": "boolean",
+                "message": "string"
+            }
+        }
+    ],
+    "events": {
+        "publishes": [
+            "ship.control.plugin_enabled",
+            "ship.control.plugin_disabled",
+            "ship.control.speed_set_response",
+            "ship.control.direction_set_response",
+            "ship.control.stop_response",
+            "ship.control.emergency_stop_response",
+            "ship.control.status_update"
+        ],
+        "subscribes": [
+            "ship.control.set_speed",
+            "ship.control.set_direction",
+            "ship.control.stop",
+            "ship.control.emergency_stop",
+            "ship.control.**"
+        ]
+    }
+}

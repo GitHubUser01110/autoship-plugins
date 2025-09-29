@@ -1,0 +1,7 @@
+{
+    "max_speed": 10.0,
+    "max_acceleration": 2.0,
+    "max_turn_rate": 30.0,
+    "emergency_decel": 5.0,
+    "control_interval": 0.1
+}
