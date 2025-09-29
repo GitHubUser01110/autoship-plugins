@@ -1,5 +1,5 @@
 {
-    "id": "ship_basic_control",
+    "id": "ShipBasicControl",
     "name": "船只基础控制插件",
     "version": "1.0.0",
     "description": "提供船只基础控制功能，包括速度控制、方向控制、停止和紧急停止等核心功能",
