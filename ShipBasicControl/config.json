@@ -1,7 +1,5 @@
 {
-    "max_speed": 10.0,
-    "max_acceleration": 2.0,
-    "max_turn_rate": 30.0,
-    "emergency_decel": 5.0,
-    "control_interval": 0.1
+    "target_device": "usb2xxx_1",
+    "command_timeout": 8.0,
+    "status_update_interval": 1.0
 }

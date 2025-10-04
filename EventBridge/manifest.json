@@ -1,0 +1,103 @@
+{
+    "id": "EventBridge",
+    "name": "事件桥接器插件",
+    "version": "1.0.0",
+    "description": "双向事件桥接器，负责通过UDP进行event_bus与设备之间的消息转换和路由",
+    "author": "Ship Control Team",
+    "entry": "plugin.py",
+    "updated_at": "2025-10-04T00:00:00Z",
+    "dependencies": [],
+    "config_schema": [
+        {
+            "key": "listen_port",
+            "type": "number",
+            "default": 13000,
+            "min": 10001,
+            "max": 65535,
+            "description": "UDP监听端口",
+            "required": true
+        },
+        {
+            "key": "devices",
+            "type": "object",
+            "default": {
+                "usb2xxx_1": {
+                    "host": "127.0.0.1",
+                    "port": 12345
+                }
+            },
+            "description": "设备路由配置表 {device_name: {host, port}}",
+            "required": true
+        },
+        {
+            "key": "socket_timeout",
+            "type": "number",
+            "default": 1.0,
+            "min": 0.1,
+            "max": 10.0,
+            "description": "Socket超时时间 (秒)",
+            "required": true
+        },
+        {
+            "key": "recv_buffer_size",
+            "type": "number",
+            "default": 4096,
+            "min": 1024,
+            "max": 65536,
+            "description": "接收缓冲区大小 (字节)",
+            "required": true
+        }
+    ],
+    "interfaces": [
+        {
+            "name": "get_bridge_status",
+            "description": "获取桥接器状态",
+            "input_schema": {},
+            "output_schema": {
+                "running": "boolean",
+                "listen_port": "number",
+                "devices_count": "number",
+                "statistics": "object"
+            }
+        },
+        {
+            "name": "get_device_address",
+            "description": "获取设备实际地址",
+            "input_schema": {
+                "device_name": "string"
+            },
+            "output_schema": {
+                "host": "string",
+                "port": "number"
+            }
+        },
+        {
+            "name": "send_raw_udp",
+            "description": "发送原始UDP消息（调试用）",
+            "input_schema": {
+                "host": "string",
+                "port": "number",
+                "message": "object"
+            },
+            "output_schema": {
+                "success": "boolean",
+                "message": "string"
+            }
+        }
+    ],
+    "events": {
+        "publishes": [
+            "device.command.result",
+            "device.status.**",
+            "sensor.**",
+            "alert.**",
+            "system.heartbeat",
+            "bridge.started",
+            "bridge.stopped",
+            "bridge.error"
+        ],
+        "subscribes": [
+            "device.command.**"
+        ]
+    }
+}
