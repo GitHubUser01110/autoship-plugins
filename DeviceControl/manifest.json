@@ -7,11 +7,7 @@
     "entry": "plugin.py",
     "updated_at": "2025-10-04T00:00:00Z",
     "dependencies": [
-        {
-            "plugin_id": "EventBridge",
-            "min_version": "1.0.0",
-            "required": true
-        }
+        "EventBridge"
     ],
     "config_schema": [
         {
