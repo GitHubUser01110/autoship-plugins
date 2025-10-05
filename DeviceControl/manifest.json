@@ -1,7 +1,7 @@
 {
     "id": "DeviceControl",
     "name": "设备统一控制插件",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "提供设备统一控制功能，支持推进器、泵、切割器、传送带、步进电机等设备的控制和状态监控",
     "author": "Ship Control Team",
     "entry": "plugin.py",
