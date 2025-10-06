@@ -14,6 +14,7 @@ import websockets
 import json
 import threading
 import time
+import traceback
 from typing import Any, Dict, Optional, Set
 from app.usv.plugin_base import Plugin, Response, PluginState
 from app.usv.event_bus import EventData, EventPriority
@@ -44,6 +45,7 @@ class EventBridgePlugin(Plugin):
 
         # 运行状态
         self._running = threading.Event()
+        self._server_ready = threading.Event()  # 服务器就绪标志
 
         # 序列号计数器
         self._seq_counter = 0
@@ -87,7 +89,7 @@ class EventBridgePlugin(Plugin):
             return Response(success=True, data="安装成功")
 
         except Exception as e:
-            self.log_error(f"安装插件失败: {e}")
+            self.log_error(f"安装插件失败: {e}\n{traceback.format_exc()}")
             return Response(success=False, data=str(e))
 
     def _handle_enable(self) -> Response:
@@ -95,6 +97,9 @@ class EventBridgePlugin(Plugin):
         self.log_info("正在启用事件桥接器插件...")
 
         try:
+            # 清除就绪标志
+            self._server_ready.clear()
+            
             # 启动WebSocket服务器
             self._running.set()
             self._server_thread = threading.Thread(
@@ -104,10 +109,11 @@ class EventBridgePlugin(Plugin):
             )
             self._server_thread.start()
 
-            # 等待服务器启动
-            time.sleep(0.5)
+            # 等待服务器就绪（增加超时时间）
+            if not self._server_ready.wait(timeout=10.0):
+                raise Exception("WebSocket服务器启动超时")
 
-            self.log_info(f"WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
+            self.log_info(f"✓ WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
 
             # 订阅设备命令事件
             self._subscribe_command_events()
@@ -131,7 +137,7 @@ class EventBridgePlugin(Plugin):
             return Response(success=True, data="启用成功")
 
         except Exception as e:
-            self.log_error(f"启用插件失败: {e}")
+            self.log_error(f"启用插件失败: {e}\n{traceback.format_exc()}")
             self._cleanup()
             return Response(success=False, data=str(e))
 
@@ -143,16 +149,23 @@ class EventBridgePlugin(Plugin):
             # 停止运行
             self._running.clear()
 
-            # 停止WebSocket服务器
+            # 停止WebSocket服务器（如果在运行）
             if self._loop and self._ws_server:
-                asyncio.run_coroutine_threadsafe(
-                    self._ws_server.wait_closed(),
-                    self._loop
-                )
+                try:
+                    # 关闭服务器
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._shutdown_server(),
+                        self._loop
+                    )
+                    future.result(timeout=5.0)
+                except Exception as e:
+                    self.log_warning(f"关闭服务器时出错: {e}")
 
             # 等待服务器线程结束
             if self._server_thread and self._server_thread.is_alive():
-                self._server_thread.join(timeout=3.0)
+                self._server_thread.join(timeout=5.0)
+                if self._server_thread.is_alive():
+                    self.log_warning("服务器线程未能在超时时间内结束")
 
             # 清理资源
             self._cleanup()
@@ -168,7 +181,7 @@ class EventBridgePlugin(Plugin):
             return Response(success=True, data="禁用成功")
 
         except Exception as e:
-            self.log_error(f"禁用插件失败: {e}")
+            self.log_error(f"禁用插件失败: {e}\n{traceback.format_exc()}")
             return Response(success=False, data=str(e))
 
     def _handle_config_update(self, old_config: Dict, new_config: Dict) -> Response:
@@ -208,27 +221,70 @@ class EventBridgePlugin(Plugin):
         try:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            
+            # 运行服务器直到完成
             self._loop.run_until_complete(self._start_server())
+            
         except Exception as e:
-            self.log_error(f"WebSocket服务器错误: {e}")
+            self.log_error(f"WebSocket服务器线程错误: {e}\n{traceback.format_exc()}")
+            self._server_ready.set()  # 确保主线程不会永久等待
         finally:
             if self._loop:
-                self._loop.close()
+                try:
+                    self._loop.close()
+                except Exception as e:
+                    self.log_warning(f"关闭事件循环时出错: {e}")
 
     async def _start_server(self):
         """启动WebSocket服务器"""
         try:
-            # 使用 async with 确保 TCP 正确绑定
-            async with websockets.serve(self._handle_client, '0.0.0.0', self._listen_port) as server:
+            self.log_info(f"正在绑定 WebSocket 服务器到 0.0.0.0:{self._listen_port}...")
+            
+            # 创建服务器 - 使用 async with 但保持运行
+            async with websockets.serve(
+                self._handle_client, 
+                '0.0.0.0', 
+                self._listen_port,
+                ping_interval=30,
+                ping_timeout=10
+            ) as server:
                 self._ws_server = server
-                self.log_info(f"WebSocket服务器运行在 ws://0.0.0.0:{self._listen_port}")
+                
+                self.log_info(f"✓ WebSocket 服务器成功绑定到端口 {self._listen_port}")
+                
+                # 设置就绪标志
+                self._server_ready.set()
+                
+                # 持续运行，直到插件停止 - 使用 asyncio.Future() 保持运行
+                stop_future = asyncio.Future()
+                
+                # 在后台检查运行状态
+                async def check_running():
+                    while self._running.is_set():
+                        await asyncio.sleep(1)
+                    stop_future.set_result(None)
+                
+                asyncio.create_task(check_running())
+                
+                # 等待停止信号
+                await stop_future
+                
+                self.log_info("WebSocket 服务器正在关闭...")
 
-                # 持续挂起，直到插件停止
-                while self._running.is_set():
-                    await asyncio.sleep(1)
-
+        except OSError as e:
+            # 端口占用等网络错误
+            self.log_error(f"WebSocket 服务器启动失败 (端口可能被占用): {e}\n{traceback.format_exc()}")
+            self._server_ready.set()  # 通知主线程启动失败
+            
         except Exception as e:
-            self.log_error(f"WebSocket服务器启动失败: {e}")
+            self.log_error(f"WebSocket 服务器启动失败: {e}\n{traceback.format_exc()}")
+            self._server_ready.set()  # 通知主线程启动失败
+
+    async def _shutdown_server(self):
+        """优雅关闭服务器"""
+        if self._ws_server:
+            self._ws_server.close()
+            await self._ws_server.wait_closed()
 
     async def _handle_client(self, websocket):
         """处理WebSocket客户端连接"""
@@ -247,7 +303,7 @@ class EventBridgePlugin(Plugin):
         except websockets.exceptions.ConnectionClosed:
             self.log_info(f"客户端断开: {client_addr}")
         except Exception as e:
-            self.log_error(f"处理客户端消息错误: {e}")
+            self.log_error(f"处理客户端消息错误: {e}\n{traceback.format_exc()}")
         finally:
             with self._connection_lock:
                 self._clients.discard(websocket)
@@ -327,7 +383,7 @@ class EventBridgePlugin(Plugin):
                     self._stats['commands_forwarded'] += 1
             
         except Exception as e:
-            self.log_error(f"处理命令事件失败: {e}", event_id=event.event_id)
+            self.log_error(f"处理命令事件失败: {e}\n{traceback.format_exc()}", event_id=event.event_id)
             with self._stats_lock:
                 self._stats['errors'] += 1
     
@@ -397,7 +453,7 @@ class EventBridgePlugin(Plugin):
             return True
             
         except Exception as e:
-            self.log_error(f"发送WebSocket命令失败: {e}")
+            self.log_error(f"发送WebSocket命令失败: {e}\n{traceback.format_exc()}")
             with self._stats_lock:
                 self._stats['errors'] += 1
             return False
@@ -442,7 +498,7 @@ class EventBridgePlugin(Plugin):
                 self._stats['errors'] += 1
             return current_device_name
         except Exception as e:
-            self.log_error(f"处理上行消息失败: {e}")
+            self.log_error(f"处理上行消息失败: {e}\n{traceback.format_exc()}")
             with self._stats_lock:
                 self._stats['errors'] += 1
             return current_device_name
