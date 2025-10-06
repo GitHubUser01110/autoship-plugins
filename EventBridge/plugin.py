@@ -21,34 +21,34 @@ from app.usv.event_bus import EventData, EventPriority
 
 class EventBridgePlugin(Plugin):
     """事件桥接器插件 (WebSocket版本)"""
-    
+
     VERSION = '1.0.0'
     MIN_COMPATIBLE_VERSION = '1.0.0'
-    
+
     def __init__(self, plugin_id: str, plugin_manager):
         super().__init__(plugin_id, plugin_manager)
-        
+
         # 配置参数
         self._listen_port = 13000
         self._devices_config: Dict[str, Dict[str, Any]] = {}
-        
+
         # WebSocket服务器和连接管理
         self._ws_server = None
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
         self._device_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._connection_lock = threading.Lock()
-        
+
         # 异步事件循环
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._server_thread: Optional[threading.Thread] = None
-        
+
         # 运行状态
         self._running = threading.Event()
-        
+
         # 序列号计数器
         self._seq_counter = 0
         self._seq_lock = threading.Lock()
-        
+
         # 统计信息
         self._stats = {
             'messages_sent': 0,
@@ -58,42 +58,42 @@ class EventBridgePlugin(Plugin):
             'start_time': 0.0
         }
         self._stats_lock = threading.Lock()
-        
+
         # 订阅者ID列表
         self._event_subscribers = []
-        
+
         self.log_info("事件桥接器插件初始化完成 (WebSocket)")
-    
+
     # ==================== 插件生命周期方法 ====================
-    
+
     def _handle_install(self) -> Response:
         """安装插件"""
         self.log_info("正在安装事件桥接器插件...")
-        
+
         try:
             # 加载配置
             self._listen_port = int(self.get_config('listen_port', 13000))
             self._devices_config = self.get_config('devices', {})
-            
+
             # 验证配置
             if not self._devices_config:
                 return Response(success=False, data="设备配置不能为空")
-            
+
             if not (1024 <= self._listen_port <= 65535):
                 return Response(success=False, data="端口号必须在1024-65535范围内")
-            
+
             self.log_info(f"配置已加载: listen_port={self._listen_port}, devices={list(self._devices_config.keys())}")
             self.log_info("事件桥接器插件安装成功")
             return Response(success=True, data="安装成功")
-            
+
         except Exception as e:
             self.log_error(f"安装插件失败: {e}")
             return Response(success=False, data=str(e))
-    
+
     def _handle_enable(self) -> Response:
         """启用插件"""
         self.log_info("正在启用事件桥接器插件...")
-        
+
         try:
             # 启动WebSocket服务器
             self._running.set()
@@ -103,19 +103,19 @@ class EventBridgePlugin(Plugin):
                 daemon=True
             )
             self._server_thread.start()
-            
+
             # 等待服务器启动
             time.sleep(0.5)
-            
+
             self.log_info(f"WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
-            
+
             # 订阅设备命令事件
             self._subscribe_command_events()
-            
+
             # 记录启动时间
             with self._stats_lock:
                 self._stats['start_time'] = time.time()
-            
+
             # 发布桥接器启动事件
             self.publish_event(
                 event_type="bridge.started",
@@ -126,72 +126,72 @@ class EventBridgePlugin(Plugin):
                 },
                 priority=EventPriority.NORMAL
             )
-            
+
             self.log_info("事件桥接器插件启用成功")
             return Response(success=True, data="启用成功")
-            
+
         except Exception as e:
             self.log_error(f"启用插件失败: {e}")
             self._cleanup()
             return Response(success=False, data=str(e))
-    
+
     def _handle_disable(self) -> Response:
         """禁用插件"""
         self.log_info("正在禁用事件桥接器插件...")
-        
+
         try:
             # 停止运行
             self._running.clear()
-            
+
             # 停止WebSocket服务器
             if self._loop and self._ws_server:
                 asyncio.run_coroutine_threadsafe(
-                    self._ws_server.close(),
+                    self._ws_server.wait_closed(),
                     self._loop
                 )
-            
+
             # 等待服务器线程结束
             if self._server_thread and self._server_thread.is_alive():
                 self._server_thread.join(timeout=3.0)
-            
+
             # 清理资源
             self._cleanup()
-            
+
             # 发布桥接器停止事件
             self.publish_event(
                 event_type="bridge.stopped",
                 data={'plugin_id': self.plugin_id},
                 priority=EventPriority.NORMAL
             )
-            
+
             self.log_info("事件桥接器插件禁用成功")
             return Response(success=True, data="禁用成功")
-            
+
         except Exception as e:
             self.log_error(f"禁用插件失败: {e}")
             return Response(success=False, data=str(e))
-    
+
     def _handle_config_update(self, old_config: Dict, new_config: Dict) -> Response:
         """处理配置更新"""
         self.log_info("正在更新配置...")
-        
+
         # 设备配置可以热更新
         if 'devices' in new_config:
             self._devices_config = new_config['devices']
             self.log_info(f"设备配置已更新: {list(self._devices_config.keys())}")
-        
+
         # 端口配置需要重启
         need_restart = False
         if 'listen_port' in new_config and new_config['listen_port'] != self._listen_port:
             need_restart = True
-        
+
         if need_restart:
             self.log_warning("端口配置变更，需要重启插件以生效")
             return Response(success=True, data="配置已保存，需要重启插件以生效")
-        
+
         self.log_info("配置更新成功")
         return Response(success=True, data="配置更新成功")
-    
+
     def _cleanup(self):
         """清理资源"""
         try:
@@ -200,58 +200,50 @@ class EventBridgePlugin(Plugin):
                 self._device_connections.clear()
         except Exception as e:
             self.log_warning(f"清理连接时出错: {e}")
-    
+
     # ==================== WebSocket服务器 ====================
-    
+
     def _run_websocket_server(self):
         """运行WebSocket服务器（在独立线程中）"""
         try:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
-            
             self._loop.run_until_complete(self._start_server())
         except Exception as e:
             self.log_error(f"WebSocket服务器错误: {e}")
         finally:
             if self._loop:
                 self._loop.close()
-    
+
     async def _start_server(self):
         """启动WebSocket服务器"""
         try:
-            self._ws_server = await websockets.serve(
-                self._handle_client,
-                '0.0.0.0',
-                self._listen_port
-            )
-            
-            self.log_info(f"WebSocket服务器运行在 ws://0.0.0.0:{self._listen_port}")
-            
-            # 保持服务器运行
-            while self._running.is_set():
-                await asyncio.sleep(1)
-            
-            # 关闭服务器
-            self._ws_server.close()
-            await self._ws_server.wait_closed()
-            
+            # 使用 async with 确保 TCP 正确绑定
+            async with websockets.serve(self._handle_client, '0.0.0.0', self._listen_port) as server:
+                self._ws_server = server
+                self.log_info(f"WebSocket服务器运行在 ws://0.0.0.0:{self._listen_port}")
+
+                # 持续挂起，直到插件停止
+                while self._running.is_set():
+                    await asyncio.sleep(1)
+
         except Exception as e:
             self.log_error(f"WebSocket服务器启动失败: {e}")
-    
+
     async def _handle_client(self, websocket):
         """处理WebSocket客户端连接"""
         client_addr = websocket.remote_address
         self.log_info(f"客户端连接: {client_addr}")
-        
+
         with self._connection_lock:
             self._clients.add(websocket)
-        
+
         device_name = None
-        
+
         try:
             async for message in websocket:
                 device_name = await self._handle_uplink_message(message, websocket, device_name)
-                
+
         except websockets.exceptions.ConnectionClosed:
             self.log_info(f"客户端断开: {client_addr}")
         except Exception as e:
@@ -263,9 +255,9 @@ class EventBridgePlugin(Plugin):
                     if self._device_connections[device_name] == websocket:
                         del self._device_connections[device_name]
                         self.log_warning(f"设备 {device_name} 已断开连接")
-    
+
     # ==================== 事件订阅 ====================
-    
+
     def _subscribe_command_events(self):
         """订阅设备命令事件"""
         result = self.subscribe_event(
