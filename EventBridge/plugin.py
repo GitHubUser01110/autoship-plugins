@@ -1,25 +1,26 @@
 """
-事件桥接器插件 - plugin.py
+事件桥接器插件 - plugin.py (WebSocket版本)
 
 功能：
-- 提供event_bus与UDP设备之间的双向消息转换
-- 订阅device.command.**事件并转发到UDP设备
-- 接收UDP设备上报并发布为event_bus事件
+- 提供event_bus与WebSocket设备之间的双向消息转换
+- 订阅device.command.**事件并转发到WebSocket设备
+- 接收WebSocket设备上报并发布为event_bus事件
 - 支持多设备路由
 - 自动心跳应答
 """
 
-import socket
+import asyncio
+import websockets
 import json
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set
 from app.usv.plugin_base import Plugin, Response, PluginState
 from app.usv.event_bus import EventData, EventPriority
 
 
 class EventBridgePlugin(Plugin):
-    """事件桥接器插件"""
+    """事件桥接器插件 (WebSocket版本)"""
     
     VERSION = '1.0.0'
     MIN_COMPATIBLE_VERSION = '1.0.0'
@@ -30,23 +31,23 @@ class EventBridgePlugin(Plugin):
         # 配置参数
         self._listen_port = 13000
         self._devices_config: Dict[str, Dict[str, Any]] = {}
-        self._socket_timeout = 1.0
-        self._recv_buffer_size = 4096
         
-        # UDP Socket
-        self._sock: Optional[socket.socket] = None
+        # WebSocket服务器和连接管理
+        self._ws_server = None
+        self._clients: Set[websockets.WebSocketServerProtocol] = set()
+        self._device_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self._connection_lock = threading.Lock()
+        
+        # 异步事件循环
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._server_thread: Optional[threading.Thread] = None
         
         # 运行状态
         self._running = threading.Event()
-        self._receiver_thread: Optional[threading.Thread] = None
         
         # 序列号计数器
         self._seq_counter = 0
         self._seq_lock = threading.Lock()
-        
-        # 设备地址缓存（从上报消息中学习）
-        self._device_addresses: Dict[str, Tuple[str, int]] = {}
-        self._address_lock = threading.Lock()
         
         # 统计信息
         self._stats = {
@@ -61,7 +62,7 @@ class EventBridgePlugin(Plugin):
         # 订阅者ID列表
         self._event_subscribers = []
         
-        self.log_info("事件桥接器插件初始化完成")
+        self.log_info("事件桥接器插件初始化完成 (WebSocket)")
     
     # ==================== 插件生命周期方法 ====================
     
@@ -73,8 +74,6 @@ class EventBridgePlugin(Plugin):
             # 加载配置
             self._listen_port = int(self.get_config('listen_port', 13000))
             self._devices_config = self.get_config('devices', {})
-            self._socket_timeout = float(self.get_config('socket_timeout', 1.0))
-            self._recv_buffer_size = int(self.get_config('recv_buffer_size', 4096))
             
             # 验证配置
             if not self._devices_config:
@@ -96,23 +95,19 @@ class EventBridgePlugin(Plugin):
         self.log_info("正在启用事件桥接器插件...")
         
         try:
-            # 创建并绑定UDP Socket
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._sock.bind(('0.0.0.0', self._listen_port))
-            self._sock.settimeout(self._socket_timeout)
-            
-            self.log_info(f"UDP Socket已绑定: 0.0.0.0:{self._listen_port}")
-            
-            # 启动接收线程
+            # 启动WebSocket服务器
             self._running.set()
-            self._receiver_thread = threading.Thread(
-                target=self._uplink_receiver,
-                name=f"{self.plugin_id}-receiver",
+            self._server_thread = threading.Thread(
+                target=self._run_websocket_server,
+                name=f"{self.plugin_id}-ws-server",
                 daemon=True
             )
-            self._receiver_thread.start()
+            self._server_thread.start()
             
-            self.log_info("UDP接收线程已启动")
+            # 等待服务器启动
+            time.sleep(0.5)
+            
+            self.log_info(f"WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
             
             # 订阅设备命令事件
             self._subscribe_command_events()
@@ -148,9 +143,16 @@ class EventBridgePlugin(Plugin):
             # 停止运行
             self._running.clear()
             
-            # 等待接收线程结束
-            if self._receiver_thread and self._receiver_thread.is_alive():
-                self._receiver_thread.join(timeout=3.0)
+            # 停止WebSocket服务器
+            if self._loop and self._ws_server:
+                asyncio.run_coroutine_threadsafe(
+                    self._ws_server.close(),
+                    self._loop
+                )
+            
+            # 等待服务器线程结束
+            if self._server_thread and self._server_thread.is_alive():
+                self._server_thread.join(timeout=3.0)
             
             # 清理资源
             self._cleanup()
@@ -178,15 +180,13 @@ class EventBridgePlugin(Plugin):
             self._devices_config = new_config['devices']
             self.log_info(f"设备配置已更新: {list(self._devices_config.keys())}")
         
-        # 其他配置需要重启
+        # 端口配置需要重启
         need_restart = False
         if 'listen_port' in new_config and new_config['listen_port'] != self._listen_port:
             need_restart = True
-        if 'socket_timeout' in new_config and new_config['socket_timeout'] != self._socket_timeout:
-            need_restart = True
         
         if need_restart:
-            self.log_warning("端口或超时配置变更，需要重启插件以生效")
+            self.log_warning("端口配置变更，需要重启插件以生效")
             return Response(success=True, data="配置已保存，需要重启插件以生效")
         
         self.log_info("配置更新成功")
@@ -195,14 +195,74 @@ class EventBridgePlugin(Plugin):
     def _cleanup(self):
         """清理资源"""
         try:
-            if self._sock:
-                self._sock.close()
-                self._sock = None
+            with self._connection_lock:
+                self._clients.clear()
+                self._device_connections.clear()
         except Exception as e:
-            self.log_warning(f"清理socket时出错: {e}")
+            self.log_warning(f"清理连接时出错: {e}")
+    
+    # ==================== WebSocket服务器 ====================
+    
+    def _run_websocket_server(self):
+        """运行WebSocket服务器（在独立线程中）"""
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            
+            self._loop.run_until_complete(self._start_server())
+        except Exception as e:
+            self.log_error(f"WebSocket服务器错误: {e}")
+        finally:
+            if self._loop:
+                self._loop.close()
+    
+    async def _start_server(self):
+        """启动WebSocket服务器"""
+        try:
+            self._ws_server = await websockets.serve(
+                self._handle_client,
+                '0.0.0.0',
+                self._listen_port
+            )
+            
+            self.log_info(f"WebSocket服务器运行在 ws://0.0.0.0:{self._listen_port}")
+            
+            # 保持服务器运行
+            while self._running.is_set():
+                await asyncio.sleep(1)
+            
+            # 关闭服务器
+            self._ws_server.close()
+            await self._ws_server.wait_closed()
+            
+        except Exception as e:
+            self.log_error(f"WebSocket服务器启动失败: {e}")
+    
+    async def _handle_client(self, websocket):
+        """处理WebSocket客户端连接"""
+        client_addr = websocket.remote_address
+        self.log_info(f"客户端连接: {client_addr}")
         
-        with self._address_lock:
-            self._device_addresses.clear()
+        with self._connection_lock:
+            self._clients.add(websocket)
+        
+        device_name = None
+        
+        try:
+            async for message in websocket:
+                device_name = await self._handle_uplink_message(message, websocket, device_name)
+                
+        except websockets.exceptions.ConnectionClosed:
+            self.log_info(f"客户端断开: {client_addr}")
+        except Exception as e:
+            self.log_error(f"处理客户端消息错误: {e}")
+        finally:
+            with self._connection_lock:
+                self._clients.discard(websocket)
+                if device_name and device_name in self._device_connections:
+                    if self._device_connections[device_name] == websocket:
+                        del self._device_connections[device_name]
+                        self.log_warning(f"设备 {device_name} 已断开连接")
     
     # ==================== 事件订阅 ====================
     
@@ -220,7 +280,7 @@ class EventBridgePlugin(Plugin):
     # ==================== 事件处理器 ====================
     
     def _handle_device_command_event(self, event: EventData):
-        """处理设备命令事件 - 转换为UDP消息"""
+        """处理设备命令事件 - 转换为WebSocket消息"""
         try:
             data = event.data
             
@@ -246,18 +306,24 @@ class EventBridgePlugin(Plugin):
                 self.log_error(f"未知设备: {target_device}")
                 return
             
-            # 构建UDP命令消息
+            # 检查设备是否已连接
+            with self._connection_lock:
+                websocket = self._device_connections.get(target_device)
+            
+            if not websocket:
+                self.log_error(f"设备未连接: {target_device}")
+                return
+            
+            # 构建WebSocket命令消息
             command_msg = self._build_command_message(
                 device_id=device_id,
                 action=action,
                 value=data.get('value')
             )
             
-            # 发送UDP命令
-            device_cfg = self._devices_config[target_device]
-            success = self._send_udp_command(
-                host=device_cfg['host'],
-                port=device_cfg['port'],
+            # 发送WebSocket命令
+            success = self._send_websocket_command(
+                websocket=websocket,
                 message=command_msg,
                 target_device=target_device,
                 device_id=device_id,
@@ -273,11 +339,10 @@ class EventBridgePlugin(Plugin):
             with self._stats_lock:
                 self._stats['errors'] += 1
     
-    # ==================== UDP消息处理 ====================
+    # ==================== 消息处理 ====================
     
     def _build_command_message(self, device_id: str, action: str, value: Any) -> Dict:
-        """构建UDP命令消息"""
-        # 根据动作类型构建命令
+        """构建命令消息"""
         command = {}
         
         if action == "on":
@@ -297,17 +362,14 @@ class EventBridgePlugin(Plugin):
         elif action == "stop":
             command = {"action": "stop"}
         else:
-            # 通用格式
             command = {"action": action}
             if value is not None:
                 command["value"] = value
         
-        # 生成序列号
         with self._seq_lock:
             seq = self._seq_counter
             self._seq_counter += 1
         
-        # 完整消息
         return {
             "type": "device_command",
             "seq": seq,
@@ -316,104 +378,84 @@ class EventBridgePlugin(Plugin):
             "timestamp": time.time()
         }
     
-    def _send_udp_command(self, host: str, port: int, message: Dict,
-                         target_device: str, device_id: str, action: str) -> bool:
-        """发送UDP命令到设备"""
+    def _send_websocket_command(self, websocket, message: Dict,
+                                target_device: str, device_id: str, action: str) -> bool:
+        """发送WebSocket命令到设备"""
         try:
-            if not self._sock:
-                self.log_error("UDP Socket未初始化")
+            if not self._loop:
+                self.log_error("事件循环未初始化")
                 return False
             
-            data = json.dumps(message).encode('utf-8')
-            self._sock.sendto(data, (host, port))
+            data = json.dumps(message)
+            
+            future = asyncio.run_coroutine_threadsafe(
+                websocket.send(data),
+                self._loop
+            )
+            future.result(timeout=5.0)
             
             with self._stats_lock:
                 self._stats['messages_sent'] += 1
             
             self.log_info(
-                f"命令已发送: {host}:{port} <- {device_id}.{action} "
+                f"命令已发送: {target_device} <- {device_id}.{action} "
                 f"(seq={message.get('seq')})"
             )
             
             return True
             
         except Exception as e:
-            self.log_error(f"发送UDP命令失败: {e}")
+            self.log_error(f"发送WebSocket命令失败: {e}")
             with self._stats_lock:
                 self._stats['errors'] += 1
             return False
     
-    def _uplink_receiver(self):
-        """上行消息接收循环"""
-        self.log_info("UDP接收线程已启动")
-        
-        while self._running.is_set() and self.is_enabled:
-            try:
-                if not self._sock:
-                    break
-                
-                data, addr = self._sock.recvfrom(self._recv_buffer_size)
-                
-                with self._stats_lock:
-                    self._stats['messages_received'] += 1
-                
-                # 在新线程中处理消息，避免阻塞接收循环
-                threading.Thread(
-                    target=self._handle_uplink_message,
-                    args=(data, addr),
-                    daemon=True
-                ).start()
-                
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self._running.is_set():
-                    self.log_error(f"接收上行消息错误: {e}")
-                    with self._stats_lock:
-                        self._stats['errors'] += 1
-        
-        self.log_info("UDP接收线程已退出")
-    
-    def _handle_uplink_message(self, data: bytes, addr: Tuple[str, int]):
-        """处理上行消息 - 转换为event_bus事件"""
+    async def _handle_uplink_message(self, data: str, websocket, current_device_name: Optional[str]) -> Optional[str]:
+        """处理上行消息"""
         try:
-            # 解析JSON消息
-            message = json.loads(data.decode('utf-8'))
+            with self._stats_lock:
+                self._stats['messages_received'] += 1
+            
+            message = json.loads(data)
             msg_type = message.get('type')
             source = message.get('source', 'unknown')
             msg_data = message.get('data', {})
             
-            self.log_debug(f"收到上行消息: {msg_type} from {addr} (source={source})")
+            self.log_debug(f"收到上行消息: {msg_type} from {websocket.remote_address} (source={source})")
             
-            # 缓存设备地址
-            if source != 'unknown':
-                with self._address_lock:
-                    self._device_addresses[source] = addr
+            if source != 'unknown' and source != current_device_name:
+                with self._connection_lock:
+                    self._device_connections[source] = websocket
+                self.log_info(f"设备 {source} 已注册连接")
+                current_device_name = source
             
-            # 根据消息类型分发处理
             if msg_type == 'command_response':
-                self._handle_command_response(message, source, addr)
+                self._handle_command_response(message, source)
             elif msg_type == 'device_status':
-                self._handle_device_status(message, source, addr)
+                self._handle_device_status(message, source)
             elif msg_type == 'sensor_data':
                 self._handle_sensor_data(message, source)
             elif msg_type == 'alert':
                 self._handle_alert(message, source)
             elif msg_type == 'heartbeat_report':
-                self._handle_heartbeat_report(message, source, addr)
+                await self._handle_heartbeat_report(message, source, websocket)
             else:
                 self.log_debug(f"未处理的上行消息类型: {msg_type} from {source}")
+            
+            return current_device_name
         
         except json.JSONDecodeError as e:
             self.log_warning(f"JSON解析失败: {e}")
             with self._stats_lock:
                 self._stats['errors'] += 1
+            return current_device_name
         except Exception as e:
             self.log_error(f"处理上行消息失败: {e}")
             with self._stats_lock:
                 self._stats['errors'] += 1
+            return current_device_name
     
-    def _handle_command_response(self, message: Dict, source: str, addr: Tuple[str, int]):
+    def _handle_command_response(self, message: Dict, source: str):
         """处理命令响应消息"""
         msg_data = message.get('data', {})
         device_id = message.get('device_id') or msg_data.get('device_id') or 'unknown'
@@ -423,15 +465,14 @@ class EventBridgePlugin(Plugin):
             data={
                 "device_id": device_id,
                 "result": msg_data,
-                "source": source,
-                "addr": f"{addr[0]}:{addr[1]}"
+                "source": source
             },
             priority=EventPriority.HIGH
         )
         
         self.log_info(f"命令响应已转发: {device_id} (source={source})")
     
-    def _handle_device_status(self, message: Dict, source: str, addr: Tuple[str, int]):
+    def _handle_device_status(self, message: Dict, source: str):
         """处理设备状态消息"""
         msg_data = message.get('data', {})
         device_id = msg_data.get('device_id') or message.get('device_id') or 'unknown'
@@ -442,8 +483,7 @@ class EventBridgePlugin(Plugin):
             data={
                 "device_id": device_id,
                 "status": status,
-                "source": source,
-                "addr": f"{addr[0]}:{addr[1]}"
+                "source": source
             },
             priority=EventPriority.NORMAL
         )
@@ -478,11 +518,10 @@ class EventBridgePlugin(Plugin):
         
         self.log_warning(f"报警已转发: level={level} (source={source})")
     
-    def _handle_heartbeat_report(self, message: Dict, source: str, addr: Tuple[str, int]):
+    async def _handle_heartbeat_report(self, message: Dict, source: str, websocket):
         """处理心跳上报消息"""
         msg_data = message.get('data', {})
         
-        # 发布心跳事件
         self.publish_event(
             event_type="system.heartbeat",
             data={
@@ -493,18 +532,13 @@ class EventBridgePlugin(Plugin):
             priority=EventPriority.LOW
         )
         
-        # 发送心跳应答
-        orig_seq = message.get('seq')
-        self._send_heartbeat_ack(addr, source, orig_seq)
+        await self._send_heartbeat_ack(websocket, source, message.get('seq'))
         
         self.log_debug(f"心跳已处理: {source}")
     
-    def _send_heartbeat_ack(self, addr: Tuple[str, int], source: str, orig_seq: Optional[int] = None):
+    async def _send_heartbeat_ack(self, websocket, source: str, orig_seq: Optional[int] = None):
         """发送心跳应答"""
         try:
-            if not self._sock:
-                return
-            
             ack_message = {
                 "type": "heartbeat_ack",
                 "source": "server",
@@ -515,10 +549,10 @@ class EventBridgePlugin(Plugin):
             if orig_seq is not None:
                 ack_message['seq'] = orig_seq
             
-            data = json.dumps(ack_message).encode('utf-8')
-            self._sock.sendto(data, addr)
+            data = json.dumps(ack_message)
+            await websocket.send(data)
             
-            self.log_debug(f"心跳应答已发送: {addr} (seq={orig_seq})")
+            self.log_debug(f"心跳应答已发送: {source} (seq={orig_seq})")
             
         except Exception as e:
             self.log_error(f"发送心跳应答失败: {e}")
@@ -526,12 +560,13 @@ class EventBridgePlugin(Plugin):
     # ==================== 插件接口方法 ====================
     
     def get_bridge_status(self, input_data: Any = None) -> Dict[str, Any]:
-        """获取桥接器状态（插件接口）"""
+        """获取桥接器状态"""
         with self._stats_lock:
             stats = self._stats.copy()
         
-        with self._address_lock:
-            learned_devices = list(self._device_addresses.keys())
+        with self._connection_lock:
+            connected_devices = list(self._device_connections.keys())
+            client_count = len(self._clients)
         
         uptime = time.time() - stats['start_time'] if stats['start_time'] > 0 else 0.0
         
@@ -539,7 +574,8 @@ class EventBridgePlugin(Plugin):
             'running': self._running.is_set(),
             'listen_port': self._listen_port,
             'configured_devices': list(self._devices_config.keys()),
-            'learned_devices': learned_devices,
+            'connected_devices': connected_devices,
+            'client_count': client_count,
             'statistics': {
                 'uptime': uptime,
                 'messages_sent': stats['messages_sent'],
@@ -549,8 +585,8 @@ class EventBridgePlugin(Plugin):
             }
         }
     
-    def get_device_address(self, input_data: Any) -> Dict[str, Any]:
-        """获取设备实际地址（插件接口）"""
+    def get_device_connection(self, input_data: Any) -> Dict[str, Any]:
+        """获取设备连接状态"""
         if not isinstance(input_data, dict):
             return {'success': False, 'message': '输入必须是字典格式'}
         
@@ -558,41 +594,53 @@ class EventBridgePlugin(Plugin):
         if not device_name:
             return {'success': False, 'message': '缺少device_name参数'}
         
-        with self._address_lock:
-            addr = self._device_addresses.get(device_name)
+        with self._connection_lock:
+            websocket = self._device_connections.get(device_name)
         
-        if addr:
+        if websocket:
             return {
                 'success': True,
-                'host': addr[0],
-                'port': addr[1]
+                'connected': True,
+                'remote_address': str(websocket.remote_address)
             }
         else:
             return {
-                'success': False,
-                'message': f'未知设备或设备未上报: {device_name}'
+                'success': True,
+                'connected': False,
+                'message': f'设备未连接: {device_name}'
             }
     
-    def send_raw_udp(self, input_data: Any) -> Dict[str, Any]:
-        """发送原始UDP消息（插件接口，调试用）"""
+    def broadcast_message(self, input_data: Any) -> Dict[str, Any]:
+        """广播消息到所有客户端"""
         if not isinstance(input_data, dict):
             return {'success': False, 'message': '输入必须是字典格式'}
         
-        host = input_data.get('host')
-        port = input_data.get('port')
         message = input_data.get('message')
-        
-        if not all([host, port, message]):
-            return {'success': False, 'message': '缺少必要参数: host, port, message'}
+        if not message:
+            return {'success': False, 'message': '缺少message参数'}
         
         try:
-            if not self._sock:
-                return {'success': False, 'message': 'UDP Socket未初始化'}
+            if not self._loop:
+                return {'success': False, 'message': '事件循环未初始化'}
             
-            data = json.dumps(message).encode('utf-8')
-            self._sock.sendto(data, (host, int(port)))
+            data = json.dumps(message)
             
-            return {'success': True, 'message': f'消息已发送到 {host}:{port}'}
+            with self._connection_lock:
+                clients = list(self._clients)
+            
+            async def _broadcast():
+                await asyncio.gather(
+                    *[client.send(data) for client in clients],
+                    return_exceptions=True
+                )
+            
+            future = asyncio.run_coroutine_threadsafe(_broadcast(), self._loop)
+            future.result(timeout=5.0)
+            
+            return {
+                'success': True,
+                'message': f'消息已广播到 {len(clients)} 个客户端'
+            }
             
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -604,12 +652,12 @@ class EventBridgePlugin(Plugin):
         with self._stats_lock:
             stats = self._stats.copy()
         
-        with self._address_lock:
-            addresses = self._device_addresses.copy()
+        with self._connection_lock:
+            devices = list(self._device_connections.keys())
         
         return {
             'statistics': stats,
-            'device_addresses': addresses,
+            'connected_devices': devices,
             'event_subscribers': self._event_subscribers.copy()
         }
     
@@ -618,10 +666,6 @@ class EventBridgePlugin(Plugin):
         if 'statistics' in custom_state:
             with self._stats_lock:
                 self._stats.update(custom_state['statistics'])
-        
-        if 'device_addresses' in custom_state:
-            with self._address_lock:
-                self._device_addresses = custom_state['device_addresses']
         
         if 'event_subscribers' in custom_state:
             self._event_subscribers = custom_state['event_subscribers']
