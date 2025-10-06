@@ -1,14 +1,12 @@
 {
     "id": "EventBridge",
     "name": "事件桥接器插件 (WebSocket)",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "基于WebSocket的双向事件桥接器，负责event_bus与设备之间的消息转换和路由",
     "author": "Ship Control Team",
     "entry": "plugin.py",
     "updated_at": "2025-10-06T00:00:00Z",
-    "dependencies": [
-        "websockets>=12.0"
-    ],
+    "dependencies": [],
     "config_schema": [
         {
             "key": "listen_port",
