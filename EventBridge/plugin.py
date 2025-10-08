@@ -260,10 +260,10 @@ class EventBridgePlugin(Plugin):
         try:
             self.log_info(f"正在绑定 WebSocket 服务器到 0.0.0.0:{self._listen_port}...")
             
-            # 修复：确保 router 函数正确定义
+            # 修复：使用 websocket.request.path 获取路径
             async def router(websocket):
-                # 从 websocket 对象获取路径
-                path = websocket.path
+                # 从 websocket.request 对象获取路径
+                path = websocket.request.path
                 self.log_debug(f"新连接: {websocket.remote_address} -> {path}")
                 
                 if path == '/ingest_video':
