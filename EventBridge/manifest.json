@@ -1,7 +1,7 @@
 {
     "id": "EventBridge",
     "name": "事件桥接器插件 (WebSocket + 摄像头)",
-    "version": "1.0.5",
+    "version": "1.1.0",
     "description": "基于WebSocket的双向事件桥接器，支持设备控制和摄像头视频流传输",
     "author": "Ship Control Team",
     "entry": "plugin.py",

@@ -1,11 +1,12 @@
 """
-事件桥接器插件 - plugin.py (WebSocket版本 + 摄像头支持 - 已修复视频流)
+事件桥接器插件 - plugin.py (WebSocket版本 + 摄像头支持 + 双连接架构)
 
-修复内容：
-1. 添加帧缓存机制 - 保存最新帧用于快照
-2. 添加帧订阅机制 - 前端可以订阅摄像头流
-3. 自动转发帧数据 - 将接收到的帧转发给订阅的客户端
-4. 处理订阅/取消订阅消息
+架构改进：
+1. 双连接架构：/ingest_video（视频流）+ /ingest_boxes（检测框）
+2. 路径路由处理：根据WebSocket连接路径分发处理
+3. 连接类型分类：视频流连接、检测框连接、通用连接
+4. 专门的处理方法：针对不同数据类型优化处理逻辑
+5. 增强的统计和监控：分类统计不同类型连接的数据传输
 """
 
 import asyncio
@@ -22,9 +23,9 @@ from app.usv.event_bus import EventData, EventPriority
 
 
 class EventBridgePlugin(Plugin):
-    """事件桥接器插件 (WebSocket版本 + 摄像头支持)"""
+    """事件桥接器插件 (WebSocket版本 + 摄像头支持 + 双连接架构)"""
 
-    VERSION = '1.0.2'
+    VERSION = '1.1.0'
     MIN_COMPATIBLE_VERSION = '1.0.0'
 
     def __init__(self, plugin_id: str, plugin_manager):
@@ -36,7 +37,13 @@ class EventBridgePlugin(Plugin):
 
         # WebSocket服务器和连接管理
         self._ws_server = None
-        self._clients: Set[websockets.WebSocketServerProtocol] = set()
+        
+        # 连接分类管理
+        self._video_clients: Set[websockets.WebSocketServerProtocol] = set()
+        self._detection_clients: Set[websockets.WebSocketServerProtocol] = set()
+        self._generic_clients: Set[websockets.WebSocketServerProtocol] = set()
+        self._all_clients: Set[websockets.WebSocketServerProtocol] = set()
+        
         self._device_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._connection_lock = threading.Lock()
 
@@ -52,12 +59,14 @@ class EventBridgePlugin(Plugin):
         self._seq_counter = 0
         self._seq_lock = threading.Lock()
 
-        # 统计信息
+        # 统计信息（增强版）
         self._stats = {
             'messages_sent': 0,
             'messages_received': 0,
             'commands_forwarded': 0,
-            'frames_forwarded': 0,  # 新增：转发的帧数
+            'frames_forwarded': 0,
+            'frames_received': 0,  # 新增：接收的帧数
+            'detections_received': 0,  # 新增：接收的检测框消息数
             'errors': 0,
             'start_time': 0.0
         }
@@ -70,13 +79,13 @@ class EventBridgePlugin(Plugin):
         self._camera_streams: Dict[str, Dict[str, Any]] = {}
         self._camera_lock = threading.Lock()
         
-        # ========== 新增：帧缓存和订阅管理 ==========
+        # 帧缓存和订阅管理
         self._camera_frame_cache: Dict[str, bytes] = {}  # {camera_id: latest_frame_data}
         self._frame_subscribers: Dict[str, Set[websockets.WebSocketServerProtocol]] = defaultdict(set)
         self._subscriber_cameras: Dict[websockets.WebSocketServerProtocol, Set[str]] = defaultdict(set)
         self._frame_cache_lock = threading.Lock()
 
-        self.log_info("事件桥接器插件初始化完成 (WebSocket + 摄像头 + 视频流修复)")
+        self.log_info("事件桥接器插件初始化完成 (双连接架构)")
 
     # ==================== 插件生命周期方法 ====================
 
@@ -121,6 +130,9 @@ class EventBridgePlugin(Plugin):
                 raise Exception("WebSocket服务器启动超时")
 
             self.log_info(f"✓ WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
+            self.log_info("  - 视频流端点: /ingest_video")
+            self.log_info("  - 检测框端点: /ingest_boxes")
+            self.log_info("  - 通用端点: / (向后兼容)")
 
             self._subscribe_command_events()
 
@@ -132,7 +144,8 @@ class EventBridgePlugin(Plugin):
                 data={
                     'plugin_id': self.plugin_id,
                     'listen_port': self._listen_port,
-                    'devices': list(self._devices_config.keys())
+                    'devices': list(self._devices_config.keys()),
+                    'endpoints': ['/ingest_video', '/ingest_boxes', '/']
                 },
                 priority=EventPriority.NORMAL
             )
@@ -205,13 +218,15 @@ class EventBridgePlugin(Plugin):
         """清理资源"""
         try:
             with self._connection_lock:
-                self._clients.clear()
+                self._video_clients.clear()
+                self._detection_clients.clear()
+                self._generic_clients.clear()
+                self._all_clients.clear()
                 self._device_connections.clear()
             
             with self._camera_lock:
                 self._camera_streams.clear()
             
-            # 新增：清理订阅和缓存
             with self._frame_cache_lock:
                 self._camera_frame_cache.clear()
                 self._frame_subscribers.clear()
@@ -220,7 +235,7 @@ class EventBridgePlugin(Plugin):
         except Exception as e:
             self.log_warning(f"清理连接时出错: {e}")
 
-    # ==================== WebSocket服务器 ====================
+    # ==================== WebSocket服务器（双连接架构）====================
 
     def _run_websocket_server(self):
         """运行WebSocket服务器（在独立线程中）"""
@@ -241,12 +256,24 @@ class EventBridgePlugin(Plugin):
                     self.log_warning(f"关闭事件循环时出错: {e}")
 
     async def _start_server(self):
-        """启动WebSocket服务器"""
+        """启动WebSocket服务器（带路由功能）"""
         try:
             self.log_info(f"正在绑定 WebSocket 服务器到 0.0.0.0:{self._listen_port}...")
             
+            # 路由处理器
+            async def router(websocket, path):
+                self.log_debug(f"新连接: {websocket.remote_address} -> {path}")
+                
+                if path == '/ingest_video':
+                    await self._handle_video_stream(websocket)
+                elif path == '/ingest_boxes':
+                    await self._handle_detection_boxes(websocket)
+                else:
+                    # 通用处理（向后兼容）
+                    await self._handle_generic_client(websocket)
+            
             async with websockets.serve(
-                self._handle_client, 
+                router,
                 '0.0.0.0', 
                 self._listen_port,
                 ping_interval=30,
@@ -286,37 +313,208 @@ class EventBridgePlugin(Plugin):
             self._ws_server.close()
             await self._ws_server.wait_closed()
 
-    async def _handle_client(self, websocket):
-        """处理WebSocket客户端连接"""
+    # ==================== 专门的连接处理器 ====================
+
+    async def _handle_video_stream(self, websocket):
+        """专门处理视频流连接 (/ingest_video)"""
         client_addr = websocket.remote_address
-        self.log_info(f"客户端连接: {client_addr}")
+        self.log_info(f"视频流客户端连接: {client_addr}")
 
         with self._connection_lock:
-            self._clients.add(websocket)
+            self._video_clients.add(websocket)
+            self._all_clients.add(websocket)
 
         device_name = None
 
         try:
             async for message in websocket:
-                device_name = await self._handle_uplink_message(message, websocket, device_name)
+                if isinstance(message, bytes):
+                    # 处理二进制视频帧
+                    device_name = await self._handle_camera_frame(message, websocket, device_name)
+                elif isinstance(message, str):
+                    # 处理JSON消息（如心跳、设备注册等）
+                    device_name = await self._handle_text_message(message, websocket, device_name)
 
         except websockets.exceptions.ConnectionClosed:
-            self.log_info(f"客户端断开: {client_addr}")
+            self.log_info(f"视频流客户端断开: {client_addr}")
         except Exception as e:
-            self.log_error(f"处理客户端消息错误: {e}\n{traceback.format_exc()}")
+            self.log_error(f"处理视频流客户端消息错误: {e}\n{traceback.format_exc()}")
         finally:
-            # 清理连接
-            with self._connection_lock:
-                self._clients.discard(websocket)
-                if device_name and device_name in self._device_connections:
-                    if self._device_connections[device_name] == websocket:
-                        del self._device_connections[device_name]
-                        self.log_warning(f"设备 {device_name} 已断开连接")
-            
-            # 新增：清理订阅
-            await self._cleanup_subscriber(websocket)
+            await self._cleanup_client_connection(websocket, device_name, 'video')
 
-    # ==================== 新增：订阅管理 ====================
+    async def _handle_detection_boxes(self, websocket):
+        """专门处理检测框连接 (/ingest_boxes)"""
+        client_addr = websocket.remote_address
+        self.log_info(f"检测框客户端连接: {client_addr}")
+
+        with self._connection_lock:
+            self._detection_clients.add(websocket)
+            self._all_clients.add(websocket)
+
+        device_name = None
+
+        try:
+            async for message in websocket:
+                if isinstance(message, str):
+                    # 处理检测框JSON消息
+                    device_name = await self._handle_detection_message(message, websocket, device_name)
+                else:
+                    self.log_warning(f"检测框连接收到非文本消息: {type(message)}")
+
+        except websockets.exceptions.ConnectionClosed:
+            self.log_info(f"检测框客户端断开: {client_addr}")
+        except Exception as e:
+            self.log_error(f"处理检测框客户端消息错误: {e}\n{traceback.format_exc()}")
+        finally:
+            await self._cleanup_client_connection(websocket, device_name, 'detection')
+
+    async def _handle_generic_client(self, websocket):
+        """处理通用客户端连接（向后兼容）"""
+        client_addr = websocket.remote_address
+        self.log_info(f"通用客户端连接: {client_addr}")
+
+        with self._connection_lock:
+            self._generic_clients.add(websocket)
+            self._all_clients.add(websocket)
+
+        device_name = None
+
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    # 处理二进制数据（摄像头帧）
+                    device_name = await self._handle_camera_frame(message, websocket, device_name)
+                elif isinstance(message, str):
+                    # 处理文本消息
+                    device_name = await self._handle_uplink_message(message, websocket, device_name)
+
+        except websockets.exceptions.ConnectionClosed:
+            self.log_info(f"通用客户端断开: {client_addr}")
+        except Exception as e:
+            self.log_error(f"处理通用客户端消息错误: {e}\n{traceback.format_exc()}")
+        finally:
+            await self._cleanup_client_connection(websocket, device_name, 'generic')
+
+    async def _cleanup_client_connection(self, websocket, device_name: Optional[str], connection_type: str):
+        """清理客户端连接"""
+        with self._connection_lock:
+            self._all_clients.discard(websocket)
+            
+            if connection_type == 'video':
+                self._video_clients.discard(websocket)
+            elif connection_type == 'detection':
+                self._detection_clients.discard(websocket)
+            elif connection_type == 'generic':
+                self._generic_clients.discard(websocket)
+            
+            if device_name and device_name in self._device_connections:
+                if self._device_connections[device_name] == websocket:
+                    del self._device_connections[device_name]
+                    self.log_warning(f"设备 {device_name} 已断开连接 (类型: {connection_type})")
+        
+        # 清理订阅
+        await self._cleanup_subscriber(websocket)
+
+    # ==================== 消息处理方法 ====================
+
+    async def _handle_detection_message(self, data: str, websocket, device_name: Optional[str]) -> Optional[str]:
+        """处理检测框JSON消息"""
+        try:
+            with self._stats_lock:
+                self._stats['messages_received'] += 1
+                self._stats['detections_received'] += 1
+
+            message = json.loads(data)
+            
+            # 检测设备注册
+            if not device_name:
+                inferred_device = message.get('device_name') or message.get('source')
+                if inferred_device:
+                    device_name = inferred_device
+                    with self._connection_lock:
+                        self._device_connections[device_name] = websocket
+                    self.log_info(f"设备 {device_name} 已通过检测框连接注册")
+
+            # 发布检测事件
+            self.publish_event(
+                event_type="detection.boxes",
+                data={
+                    "camera_id": message.get('camera_id'),
+                    "device_name": message.get('device_name') or device_name,
+                    "detections": message.get('det', []),
+                    "frame_id": message.get('id'),
+                    "timestamp": message.get('ts'),
+                    "scale": message.get('scale'),
+                    "frame_size": (message.get('w'), message.get('h')),
+                    "detection_count": len(message.get('det', []))
+                },
+                priority=EventPriority.NORMAL
+            )
+
+            det_count = len(message.get('det', []))
+            self.log_debug(f"检测框已处理: {det_count}个目标 (camera_id: {message.get('camera_id')})")
+
+            return device_name
+
+        except json.JSONDecodeError as e:
+            self.log_warning(f"检测框JSON解析失败: {e}")
+            with self._stats_lock:
+                self._stats['errors'] += 1
+            return device_name
+        except Exception as e:
+            self.log_error(f"处理检测框消息失败: {e}\n{traceback.format_exc()}")
+            with self._stats_lock:
+                self._stats['errors'] += 1
+            return device_name
+
+    async def _handle_text_message(self, data: str, websocket, device_name: Optional[str]) -> Optional[str]:
+        """处理通用文本消息"""
+        try:
+            with self._stats_lock:
+                self._stats['messages_received'] += 1
+
+            message = json.loads(data)
+            msg_type = message.get('type')
+            source = message.get('source', 'unknown')
+
+            self.log_debug(f"收到文本消息: {msg_type} from {websocket.remote_address} (source={source})")
+
+            # 设备注册处理
+            if source != 'unknown' and source != device_name:
+                with self._connection_lock:
+                    self._device_connections[source] = websocket
+                self.log_info(f"设备 {source} 已注册连接")
+                device_name = source
+
+            # 消息类型处理
+            if msg_type == 'heartbeat_report':
+                await self._handle_heartbeat_report(message, source, websocket)
+            elif msg_type == 'subscribe_camera':
+                camera_id = message.get('camera_id')
+                if camera_id:
+                    await self._subscribe_camera_stream(websocket, camera_id)
+            elif msg_type == 'unsubscribe_camera':
+                camera_id = message.get('camera_id')
+                if camera_id:
+                    await self._unsubscribe_camera_stream(websocket, camera_id)
+            else:
+                # 其他消息类型转发到通用处理器
+                device_name = await self._handle_uplink_message(data, websocket, device_name)
+
+            return device_name
+
+        except json.JSONDecodeError as e:
+            self.log_warning(f"文本消息JSON解析失败: {e}")
+            with self._stats_lock:
+                self._stats['errors'] += 1
+            return device_name
+        except Exception as e:
+            self.log_error(f"处理文本消息失败: {e}\n{traceback.format_exc()}")
+            with self._stats_lock:
+                self._stats['errors'] += 1
+            return device_name
+
+    # ==================== 订阅管理 ====================
     
     async def _subscribe_camera_stream(self, websocket, camera_id: str):
         """订阅摄像头流"""
@@ -462,7 +660,7 @@ class EventBridgePlugin(Plugin):
             with self._stats_lock:
                 self._stats['errors'] += 1
     
-    # ==================== 消息处理 ====================
+    # ==================== 消息构建和发送 ====================
     
     def _build_command_message(self, device_id: str, action: str, value: Any) -> Dict:
         """构建命令消息"""
@@ -533,15 +731,10 @@ class EventBridgePlugin(Plugin):
                 self._stats['errors'] += 1
             return False
     
-    async def _handle_uplink_message(self, data: Union[str, bytes], websocket, 
+    async def _handle_uplink_message(self, data: str, websocket, 
                                     current_device_name: Optional[str]) -> Optional[str]:
-        """处理上行消息（支持文本和二进制）"""
+        """处理上行消息（兼容旧版本）"""
         try:
-            # 处理二进制数据（摄像头帧）
-            if isinstance(data, bytes):
-                return await self._handle_camera_frame(data, websocket, current_device_name)
-            
-            # 处理JSON文本消息
             with self._stats_lock:
                 self._stats['messages_received'] += 1
             
@@ -575,7 +768,6 @@ class EventBridgePlugin(Plugin):
                 self._handle_camera_stream_started(message, source)
             elif msg_type == 'camera_stream_stopped':
                 self._handle_camera_stream_stopped(message, source)
-            # 新增：处理订阅消息
             elif msg_type == 'subscribe_camera':
                 camera_id = message.get('camera_id')
                 if camera_id:
@@ -743,7 +935,7 @@ class EventBridgePlugin(Plugin):
                 stream_info['last_frame_seq'] = frame_seq
                 stream_info['last_frame_size'] = len(jpeg_data)
             
-            # ========== 关键修复：缓存帧并转发给订阅者 ==========
+            # 缓存帧并转发给订阅者
             with self._frame_cache_lock:
                 # 缓存最新帧（用于快照和新订阅者）
                 self._camera_frame_cache[camera_id] = data
@@ -783,13 +975,13 @@ class EventBridgePlugin(Plugin):
                     "timestamp": timestamp,
                     "frame_size": len(jpeg_data),
                     "subscriber_count": len(subscribers) if subscribers else 0
-                    # 注意：不在事件中传递二进制数据，避免序列化问题
                 },
                 priority=EventPriority.NORMAL
             )
             
             with self._stats_lock:
                 self._stats['messages_received'] += 1
+                self._stats['frames_received'] += 1
             
             return device_name
             
@@ -861,16 +1053,19 @@ class EventBridgePlugin(Plugin):
         
         self.log_info(f"摄像头流已停止: {camera_id} (source={source})")
     
-    # ==================== 插件接口方法 ====================
+    # ==================== 插件接口方法（增强版）====================
     
     def get_bridge_status(self, input_data: Any = None) -> Dict[str, Any]:
-        """获取桥接器状态"""
+        """获取桥接器状态（增强版）"""
         with self._stats_lock:
             stats = self._stats.copy()
         
         with self._connection_lock:
             connected_devices = list(self._device_connections.keys())
-            client_count = len(self._clients)
+            video_client_count = len(self._video_clients)
+            detection_client_count = len(self._detection_clients)
+            generic_client_count = len(self._generic_clients)
+            total_client_count = len(self._all_clients)
         
         with self._camera_lock:
             camera_count = len(self._camera_streams)
@@ -885,15 +1080,23 @@ class EventBridgePlugin(Plugin):
             'listen_port': self._listen_port,
             'configured_devices': list(self._devices_config.keys()),
             'connected_devices': connected_devices,
-            'client_count': client_count,
+            'connection_types': {
+                'video_clients': video_client_count,
+                'detection_clients': detection_client_count,
+                'generic_clients': generic_client_count,
+                'total_clients': total_client_count
+            },
             'camera_stream_count': camera_count,
             'frame_subscriber_count': subscriber_count,
+            'endpoints': ['/ingest_video', '/ingest_boxes', '/'],
             'statistics': {
                 'uptime': uptime,
                 'messages_sent': stats['messages_sent'],
                 'messages_received': stats['messages_received'],
                 'commands_forwarded': stats['commands_forwarded'],
+                'frames_received': stats['frames_received'],
                 'frames_forwarded': stats['frames_forwarded'],
+                'detections_received': stats['detections_received'],
                 'errors': stats['errors']
             }
         }
@@ -911,7 +1114,6 @@ class EventBridgePlugin(Plugin):
             frame_data = self._camera_frame_cache.get(camera_id)
         
         if frame_data:
-            # 返回二进制数据的base64编码或直接返回
             import base64
             return {
                 'success': True,
@@ -972,13 +1174,31 @@ class EventBridgePlugin(Plugin):
             'streams': streams
         }
     
+    def get_connection_details(self, input_data: Any = None) -> Dict[str, Any]:
+        """获取连接详情（新增方法）"""
+        with self._connection_lock:
+            connection_details = {
+                'video_clients': [str(ws.remote_address) for ws in self._video_clients],
+                'detection_clients': [str(ws.remote_address) for ws in self._detection_clients],
+                'generic_clients': [str(ws.remote_address) for ws in self._generic_clients],
+                'device_connections': {
+                    device: str(ws.remote_address) for device, ws in self._device_connections.items()
+                }
+            }
+        
+        return {
+            'success': True,
+            'connection_details': connection_details,
+            'total_connections': len(self._all_clients)
+        }
+    
     def stop_camera_stream(self, input_data: Any) -> Dict[str, Any]:
         """停止指定摄像头流"""
         if not isinstance(input_data, dict):
             return {'success': False, 'message': '输入必须是字典格式'}
         
         camera_id = input_data.get('camera_id')
-        device_name = input_data.get('device_name', 'usb2xxx_1')
+        device_name = input_data.get('device_name', 'jetson_ai_camera')
         
         if not camera_id:
             return {'success': False, 'message': '缺少camera_id参数'}
@@ -1020,6 +1240,9 @@ class EventBridgePlugin(Plugin):
         
         with self._connection_lock:
             devices = list(self._device_connections.keys())
+            video_clients = len(self._video_clients)
+            detection_clients = len(self._detection_clients)
+            generic_clients = len(self._generic_clients)
         
         with self._camera_lock:
             cameras = list(self._camera_streams.keys())
@@ -1027,6 +1250,11 @@ class EventBridgePlugin(Plugin):
         return {
             'statistics': stats,
             'connected_devices': devices,
+            'connection_counts': {
+                'video': video_clients,
+                'detection': detection_clients,
+                'generic': generic_clients
+            },
             'camera_streams': cameras,
             'event_subscribers': self._event_subscribers.copy()
         }
