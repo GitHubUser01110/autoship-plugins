@@ -1,13 +1,11 @@
 """
-事件桥接器插件 - plugin.py (WebSocket版本 + 摄像头支持)
+事件桥接器插件 - plugin.py (WebSocket版本 + 摄像头支持 - 已修复视频流)
 
-功能：
-- 提供event_bus与WebSocket设备之间的双向消息转换
-- 订阅device.command.**事件并转发到WebSocket设备
-- 接收WebSocket设备上报并发布为event_bus事件
-- 支持多设备路由
-- 自动心跳应答
-- 支持摄像头视频流传输（二进制帧）
+修复内容：
+1. 添加帧缓存机制 - 保存最新帧用于快照
+2. 添加帧订阅机制 - 前端可以订阅摄像头流
+3. 自动转发帧数据 - 将接收到的帧转发给订阅的客户端
+4. 处理订阅/取消订阅消息
 """
 
 import asyncio
@@ -18,6 +16,7 @@ import time
 import struct
 import traceback
 from typing import Any, Dict, Optional, Set, Union
+from collections import defaultdict
 from app.usv.plugin_base import Plugin, Response, PluginState
 from app.usv.event_bus import EventData, EventPriority
 
@@ -25,7 +24,7 @@ from app.usv.event_bus import EventData, EventPriority
 class EventBridgePlugin(Plugin):
     """事件桥接器插件 (WebSocket版本 + 摄像头支持)"""
 
-    VERSION = '1.0.1'
+    VERSION = '1.0.2'
     MIN_COMPATIBLE_VERSION = '1.0.0'
 
     def __init__(self, plugin_id: str, plugin_manager):
@@ -47,7 +46,7 @@ class EventBridgePlugin(Plugin):
 
         # 运行状态
         self._running = threading.Event()
-        self._server_ready = threading.Event()  # 服务器就绪标志
+        self._server_ready = threading.Event()
 
         # 序列号计数器
         self._seq_counter = 0
@@ -58,6 +57,7 @@ class EventBridgePlugin(Plugin):
             'messages_sent': 0,
             'messages_received': 0,
             'commands_forwarded': 0,
+            'frames_forwarded': 0,  # 新增：转发的帧数
             'errors': 0,
             'start_time': 0.0
         }
@@ -67,10 +67,16 @@ class EventBridgePlugin(Plugin):
         self._event_subscribers = []
 
         # 摄像头流管理
-        self._camera_streams: Dict[str, Dict[str, Any]] = {}  # {camera_id: {device, websocket, frame_count, ...}}
+        self._camera_streams: Dict[str, Dict[str, Any]] = {}
         self._camera_lock = threading.Lock()
+        
+        # ========== 新增：帧缓存和订阅管理 ==========
+        self._camera_frame_cache: Dict[str, bytes] = {}  # {camera_id: latest_frame_data}
+        self._frame_subscribers: Dict[str, Set[websockets.WebSocketServerProtocol]] = defaultdict(set)
+        self._subscriber_cameras: Dict[websockets.WebSocketServerProtocol, Set[str]] = defaultdict(set)
+        self._frame_cache_lock = threading.Lock()
 
-        self.log_info("事件桥接器插件初始化完成 (WebSocket + 摄像头)")
+        self.log_info("事件桥接器插件初始化完成 (WebSocket + 摄像头 + 视频流修复)")
 
     # ==================== 插件生命周期方法 ====================
 
@@ -79,11 +85,9 @@ class EventBridgePlugin(Plugin):
         self.log_info("正在安装事件桥接器插件...")
 
         try:
-            # 加载配置
             self._listen_port = int(self.get_config('listen_port', 13000))
             self._devices_config = self.get_config('devices', {})
 
-            # 验证配置
             if not self._devices_config:
                 return Response(success=False, data="设备配置不能为空")
 
@@ -103,10 +107,8 @@ class EventBridgePlugin(Plugin):
         self.log_info("正在启用事件桥接器插件...")
 
         try:
-            # 清除就绪标志
             self._server_ready.clear()
             
-            # 启动WebSocket服务器
             self._running.set()
             self._server_thread = threading.Thread(
                 target=self._run_websocket_server,
@@ -115,20 +117,16 @@ class EventBridgePlugin(Plugin):
             )
             self._server_thread.start()
 
-            # 等待服务器就绪（增加超时时间）
             if not self._server_ready.wait(timeout=10.0):
                 raise Exception("WebSocket服务器启动超时")
 
             self.log_info(f"✓ WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
 
-            # 订阅设备命令事件
             self._subscribe_command_events()
 
-            # 记录启动时间
             with self._stats_lock:
                 self._stats['start_time'] = time.time()
 
-            # 发布桥接器启动事件
             self.publish_event(
                 event_type="bridge.started",
                 data={
@@ -152,13 +150,10 @@ class EventBridgePlugin(Plugin):
         self.log_info("正在禁用事件桥接器插件...")
 
         try:
-            # 停止运行
             self._running.clear()
 
-            # 停止WebSocket服务器（如果在运行）
             if self._loop and self._ws_server:
                 try:
-                    # 关闭服务器
                     future = asyncio.run_coroutine_threadsafe(
                         self._shutdown_server(),
                         self._loop
@@ -167,16 +162,13 @@ class EventBridgePlugin(Plugin):
                 except Exception as e:
                     self.log_warning(f"关闭服务器时出错: {e}")
 
-            # 等待服务器线程结束
             if self._server_thread and self._server_thread.is_alive():
                 self._server_thread.join(timeout=5.0)
                 if self._server_thread.is_alive():
                     self.log_warning("服务器线程未能在超时时间内结束")
 
-            # 清理资源
             self._cleanup()
 
-            # 发布桥接器停止事件
             self.publish_event(
                 event_type="bridge.stopped",
                 data={'plugin_id': self.plugin_id},
@@ -194,12 +186,10 @@ class EventBridgePlugin(Plugin):
         """处理配置更新"""
         self.log_info("正在更新配置...")
 
-        # 设备配置可以热更新
         if 'devices' in new_config:
             self._devices_config = new_config['devices']
             self.log_info(f"设备配置已更新: {list(self._devices_config.keys())}")
 
-        # 端口配置需要重启
         need_restart = False
         if 'listen_port' in new_config and new_config['listen_port'] != self._listen_port:
             need_restart = True
@@ -220,6 +210,13 @@ class EventBridgePlugin(Plugin):
             
             with self._camera_lock:
                 self._camera_streams.clear()
+            
+            # 新增：清理订阅和缓存
+            with self._frame_cache_lock:
+                self._camera_frame_cache.clear()
+                self._frame_subscribers.clear()
+                self._subscriber_cameras.clear()
+                
         except Exception as e:
             self.log_warning(f"清理连接时出错: {e}")
 
@@ -231,12 +228,11 @@ class EventBridgePlugin(Plugin):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             
-            # 运行服务器直到完成
             self._loop.run_until_complete(self._start_server())
             
         except Exception as e:
             self.log_error(f"WebSocket服务器线程错误: {e}\n{traceback.format_exc()}")
-            self._server_ready.set()  # 确保主线程不会永久等待
+            self._server_ready.set()
         finally:
             if self._loop:
                 try:
@@ -249,26 +245,22 @@ class EventBridgePlugin(Plugin):
         try:
             self.log_info(f"正在绑定 WebSocket 服务器到 0.0.0.0:{self._listen_port}...")
             
-            # 创建服务器 - 使用 async with 但保持运行
             async with websockets.serve(
                 self._handle_client, 
                 '0.0.0.0', 
                 self._listen_port,
                 ping_interval=30,
                 ping_timeout=10,
-                max_size=10 * 1024 * 1024  # 10MB，支持大帧
+                max_size=10 * 1024 * 1024
             ) as server:
                 self._ws_server = server
                 
                 self.log_info(f"✓ WebSocket 服务器成功绑定到端口 {self._listen_port}")
                 
-                # 设置就绪标志
                 self._server_ready.set()
                 
-                # 持续运行，直到插件停止 - 使用 asyncio.Future() 保持运行
                 stop_future = asyncio.Future()
                 
-                # 在后台检查运行状态
                 async def check_running():
                     while self._running.is_set():
                         await asyncio.sleep(1)
@@ -276,19 +268,17 @@ class EventBridgePlugin(Plugin):
                 
                 asyncio.create_task(check_running())
                 
-                # 等待停止信号
                 await stop_future
                 
                 self.log_info("WebSocket 服务器正在关闭...")
 
         except OSError as e:
-            # 端口占用等网络错误
             self.log_error(f"WebSocket 服务器启动失败 (端口可能被占用): {e}\n{traceback.format_exc()}")
-            self._server_ready.set()  # 通知主线程启动失败
+            self._server_ready.set()
             
         except Exception as e:
             self.log_error(f"WebSocket 服务器启动失败: {e}\n{traceback.format_exc()}")
-            self._server_ready.set()  # 通知主线程启动失败
+            self._server_ready.set()
 
     async def _shutdown_server(self):
         """优雅关闭服务器"""
@@ -315,12 +305,93 @@ class EventBridgePlugin(Plugin):
         except Exception as e:
             self.log_error(f"处理客户端消息错误: {e}\n{traceback.format_exc()}")
         finally:
+            # 清理连接
             with self._connection_lock:
                 self._clients.discard(websocket)
                 if device_name and device_name in self._device_connections:
                     if self._device_connections[device_name] == websocket:
                         del self._device_connections[device_name]
                         self.log_warning(f"设备 {device_name} 已断开连接")
+            
+            # 新增：清理订阅
+            await self._cleanup_subscriber(websocket)
+
+    # ==================== 新增：订阅管理 ====================
+    
+    async def _subscribe_camera_stream(self, websocket, camera_id: str):
+        """订阅摄像头流"""
+        with self._frame_cache_lock:
+            self._frame_subscribers[camera_id].add(websocket)
+            self._subscriber_cameras[websocket].add(camera_id)
+        
+        self.log_info(f"客户端订阅摄像头流: {camera_id} ({websocket.remote_address})")
+        
+        # 发送订阅确认
+        ack_msg = {
+            "type": "subscribe_ack",
+            "camera_id": camera_id,
+            "status": "success",
+            "timestamp": time.time()
+        }
+        
+        try:
+            await websocket.send(json.dumps(ack_msg))
+            
+            # 如果有缓存的最新帧，立即发送
+            if camera_id in self._camera_frame_cache:
+                await websocket.send(self._camera_frame_cache[camera_id])
+                self.log_debug(f"发送缓存帧给新订阅者: {camera_id}")
+                
+        except Exception as e:
+            self.log_error(f"发送订阅确认失败: {e}")
+    
+    async def _unsubscribe_camera_stream(self, websocket, camera_id: str):
+        """取消订阅摄像头流"""
+        with self._frame_cache_lock:
+            if camera_id in self._frame_subscribers:
+                self._frame_subscribers[camera_id].discard(websocket)
+                if not self._frame_subscribers[camera_id]:
+                    del self._frame_subscribers[camera_id]
+            
+            if websocket in self._subscriber_cameras:
+                self._subscriber_cameras[websocket].discard(camera_id)
+                if not self._subscriber_cameras[websocket]:
+                    del self._subscriber_cameras[websocket]
+        
+        self.log_info(f"客户端取消订阅摄像头流: {camera_id} ({websocket.remote_address})")
+        
+        # 发送取消订阅确认
+        ack_msg = {
+            "type": "unsubscribe_ack",
+            "camera_id": camera_id,
+            "status": "success",
+            "timestamp": time.time()
+        }
+        
+        try:
+            await websocket.send(json.dumps(ack_msg))
+        except Exception as e:
+            self.log_error(f"发送取消订阅确认失败: {e}")
+    
+    async def _cleanup_subscriber(self, websocket):
+        """清理订阅者"""
+        with self._frame_cache_lock:
+            # 获取该客户端订阅的所有摄像头
+            subscribed_cameras = self._subscriber_cameras.get(websocket, set()).copy()
+            
+            # 从所有订阅中移除该客户端
+            for camera_id in subscribed_cameras:
+                if camera_id in self._frame_subscribers:
+                    self._frame_subscribers[camera_id].discard(websocket)
+                    if not self._frame_subscribers[camera_id]:
+                        del self._frame_subscribers[camera_id]
+            
+            # 移除客户端记录
+            if websocket in self._subscriber_cameras:
+                del self._subscriber_cameras[websocket]
+        
+        if subscribed_cameras:
+            self.log_info(f"清理订阅者: {websocket.remote_address}, 订阅的摄像头: {subscribed_cameras}")
 
     # ==================== 事件订阅 ====================
 
@@ -342,7 +413,6 @@ class EventBridgePlugin(Plugin):
         try:
             data = event.data
             
-            # 验证数据格式
             if not isinstance(data, dict):
                 self.log_debug("忽略非字典格式的命令事件")
                 return
@@ -351,7 +421,6 @@ class EventBridgePlugin(Plugin):
             device_id = data.get('device_id')
             action = data.get('action')
             
-            # 必要字段检查
             if not all([target_device, device_id, action]):
                 self.log_debug(f"忽略不完整的命令事件: {data}")
                 return
@@ -359,12 +428,10 @@ class EventBridgePlugin(Plugin):
             self.log_info(f"收到命令事件: {target_device}.{device_id}.{action}",
                          event_id=event.event_id, source=event.source)
             
-            # 检查设备配置
             if target_device not in self._devices_config:
                 self.log_error(f"未知设备: {target_device}")
                 return
             
-            # 检查设备是否已连接
             with self._connection_lock:
                 websocket = self._device_connections.get(target_device)
             
@@ -372,14 +439,12 @@ class EventBridgePlugin(Plugin):
                 self.log_error(f"设备未连接: {target_device}")
                 return
             
-            # 构建WebSocket命令消息
             command_msg = self._build_command_message(
                 device_id=device_id,
                 action=action,
                 value=data.get('value')
             )
             
-            # 发送WebSocket命令
             success = self._send_websocket_command(
                 websocket=websocket,
                 message=command_msg,
@@ -476,7 +541,7 @@ class EventBridgePlugin(Plugin):
             if isinstance(data, bytes):
                 return await self._handle_camera_frame(data, websocket, current_device_name)
             
-            # 处理JSON文本消息（原有逻辑）
+            # 处理JSON文本消息
             with self._stats_lock:
                 self._stats['messages_received'] += 1
             
@@ -510,6 +575,15 @@ class EventBridgePlugin(Plugin):
                 self._handle_camera_stream_started(message, source)
             elif msg_type == 'camera_stream_stopped':
                 self._handle_camera_stream_stopped(message, source)
+            # 新增：处理订阅消息
+            elif msg_type == 'subscribe_camera':
+                camera_id = message.get('camera_id')
+                if camera_id:
+                    await self._subscribe_camera_stream(websocket, camera_id)
+            elif msg_type == 'unsubscribe_camera':
+                camera_id = message.get('camera_id')
+                if camera_id:
+                    await self._unsubscribe_camera_stream(websocket, camera_id)
             else:
                 self.log_debug(f"未处理的上行消息类型: {msg_type} from {source}")
             
@@ -632,15 +706,9 @@ class EventBridgePlugin(Plugin):
     
     async def _handle_camera_frame(self, data: bytes, websocket, 
                                    device_name: Optional[str]) -> Optional[str]:
-        """处理摄像头二进制帧数据
-        
-        帧格式：
-        [4字节:magic] [4字节:camera_id长度] [N字节:camera_id] 
-        [4字节:帧序号] [8字节:时间戳] [剩余:JPEG数据]
-        magic = 0x43414D46 (CAMF)
-        """
+        """处理摄像头二进制帧数据并转发给订阅者"""
         try:
-            if len(data) < 20:  # 最小头部长度
+            if len(data) < 20:
                 self.log_warning(f"摄像头帧数据过短: {len(data)} bytes")
                 return device_name
             
@@ -675,7 +743,37 @@ class EventBridgePlugin(Plugin):
                 stream_info['last_frame_seq'] = frame_seq
                 stream_info['last_frame_size'] = len(jpeg_data)
             
-            # 发布摄像头帧事件
+            # ========== 关键修复：缓存帧并转发给订阅者 ==========
+            with self._frame_cache_lock:
+                # 缓存最新帧（用于快照和新订阅者）
+                self._camera_frame_cache[camera_id] = data
+                
+                # 获取该摄像头的所有订阅者
+                subscribers = self._frame_subscribers.get(camera_id, set()).copy()
+            
+            # 转发帧给所有订阅者
+            if subscribers:
+                forward_count = 0
+                failed_count = 0
+                
+                for subscriber in subscribers:
+                    try:
+                        await subscriber.send(data)
+                        forward_count += 1
+                    except Exception as e:
+                        self.log_warning(f"转发帧失败: {subscriber.remote_address} - {e}")
+                        failed_count += 1
+                
+                if forward_count > 0:
+                    with self._stats_lock:
+                        self._stats['frames_forwarded'] += forward_count
+                    
+                    self.log_debug(
+                        f"帧已转发: {camera_id} seq={frame_seq} -> "
+                        f"{forward_count}个订阅者 (失败:{failed_count})"
+                    )
+            
+            # 发布事件（用于后端其他插件处理）
             self.publish_event(
                 event_type=f"camera.frame.{camera_id}",
                 data={
@@ -684,12 +782,11 @@ class EventBridgePlugin(Plugin):
                     "frame_seq": frame_seq,
                     "timestamp": timestamp,
                     "frame_size": len(jpeg_data),
-                    "jpeg_data": jpeg_data  # 二进制数据
+                    "subscriber_count": len(subscribers) if subscribers else 0
+                    # 注意：不在事件中传递二进制数据，避免序列化问题
                 },
                 priority=EventPriority.NORMAL
             )
-            
-            self.log_debug(f"摄像头帧已接收: {camera_id} seq={frame_seq} size={len(jpeg_data)}")
             
             with self._stats_lock:
                 self._stats['messages_received'] += 1
@@ -697,7 +794,7 @@ class EventBridgePlugin(Plugin):
             return device_name
             
         except Exception as e:
-            self.log_error(f"处理摄像头帧失败: {e}")
+            self.log_error(f"处理摄像头帧失败: {e}\n{traceback.format_exc()}")
             return device_name
     
     def _handle_camera_control_response(self, message: Dict, source: str):
@@ -748,6 +845,11 @@ class EventBridgePlugin(Plugin):
             if camera_id in self._camera_streams:
                 del self._camera_streams[camera_id]
         
+        # 清理缓存
+        with self._frame_cache_lock:
+            if camera_id in self._camera_frame_cache:
+                del self._camera_frame_cache[camera_id]
+        
         self.publish_event(
             event_type=f"camera.stream.stopped",
             data={
@@ -773,6 +875,9 @@ class EventBridgePlugin(Plugin):
         with self._camera_lock:
             camera_count = len(self._camera_streams)
         
+        with self._frame_cache_lock:
+            subscriber_count = sum(len(subs) for subs in self._frame_subscribers.values())
+        
         uptime = time.time() - stats['start_time'] if stats['start_time'] > 0 else 0.0
         
         return {
@@ -782,74 +887,58 @@ class EventBridgePlugin(Plugin):
             'connected_devices': connected_devices,
             'client_count': client_count,
             'camera_stream_count': camera_count,
+            'frame_subscriber_count': subscriber_count,
             'statistics': {
                 'uptime': uptime,
                 'messages_sent': stats['messages_sent'],
                 'messages_received': stats['messages_received'],
                 'commands_forwarded': stats['commands_forwarded'],
+                'frames_forwarded': stats['frames_forwarded'],
                 'errors': stats['errors']
             }
         }
     
-    def get_device_connection(self, input_data: Any) -> Dict[str, Any]:
-        """获取设备连接状态"""
+    def get_latest_frame(self, input_data: Any) -> Dict[str, Any]:
+        """获取最新帧（用于快照）"""
         if not isinstance(input_data, dict):
             return {'success': False, 'message': '输入必须是字典格式'}
         
-        device_name = input_data.get('device_name')
-        if not device_name:
-            return {'success': False, 'message': '缺少device_name参数'}
+        camera_id = input_data.get('camera_id')
+        if not camera_id:
+            return {'success': False, 'message': '缺少camera_id参数'}
         
-        with self._connection_lock:
-            websocket = self._device_connections.get(device_name)
+        with self._frame_cache_lock:
+            frame_data = self._camera_frame_cache.get(camera_id)
         
-        if websocket:
+        if frame_data:
+            # 返回二进制数据的base64编码或直接返回
+            import base64
             return {
                 'success': True,
-                'connected': True,
-                'remote_address': str(websocket.remote_address)
+                'camera_id': camera_id,
+                'frame_data': base64.b64encode(frame_data).decode('utf-8'),
+                'frame_size': len(frame_data)
             }
         else:
             return {
-                'success': True,
-                'connected': False,
-                'message': f'设备未连接: {device_name}'
+                'success': False,
+                'message': f'没有缓存的帧: {camera_id}'
             }
     
-    def broadcast_message(self, input_data: Any) -> Dict[str, Any]:
-        """广播消息到所有客户端"""
-        if not isinstance(input_data, dict):
-            return {'success': False, 'message': '输入必须是字典格式'}
+    def get_camera_subscribers(self, input_data: Any = None) -> Dict[str, Any]:
+        """获取摄像头订阅者信息"""
+        with self._frame_cache_lock:
+            subscriber_info = {}
+            for camera_id, subscribers in self._frame_subscribers.items():
+                subscriber_info[camera_id] = {
+                    'subscriber_count': len(subscribers),
+                    'subscribers': [str(ws.remote_address) for ws in subscribers]
+                }
         
-        message = input_data.get('message')
-        if not message:
-            return {'success': False, 'message': '缺少message参数'}
-        
-        try:
-            if not self._loop:
-                return {'success': False, 'message': '事件循环未初始化'}
-            
-            data = json.dumps(message)
-            
-            with self._connection_lock:
-                clients = list(self._clients)
-            
-            async def _broadcast():
-                await asyncio.gather(
-                    *[client.send(data) for client in clients],
-                    return_exceptions=True
-                )
-            
-            future = asyncio.run_coroutine_threadsafe(_broadcast(), self._loop)
-            future.result(timeout=5.0)
-            
-            return {
-                'success': True,
-                'message': f'消息已广播到 {len(clients)} 个客户端'
-            }
-            
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return {
+            'success': True,
+            'subscribers': subscriber_info
+        }
     
     def get_camera_streams(self, input_data: Any = None) -> Dict[str, Any]:
         """获取当前所有摄像头流信息"""
@@ -871,6 +960,12 @@ class EventBridgePlugin(Plugin):
                     'last_frame_time': info.get('last_frame_time')
                 }
         
+        with self._frame_cache_lock:
+            for camera_id in streams:
+                streams[camera_id]['subscriber_count'] = len(
+                    self._frame_subscribers.get(camera_id, set())
+                )
+        
         return {
             'success': True,
             'stream_count': len(streams),
@@ -888,7 +983,6 @@ class EventBridgePlugin(Plugin):
         if not camera_id:
             return {'success': False, 'message': '缺少camera_id参数'}
         
-        # 发送停止命令
         command_msg = {
             "type": "camera_control",
             "camera_id": camera_id,
@@ -947,5 +1041,4 @@ class EventBridgePlugin(Plugin):
             self._event_subscribers = custom_state['event_subscribers']
 
 
-# 插件类导出
 __plugin_class__ = EventBridgePlugin
