@@ -1,5 +1,5 @@
 """
-事件桥接器插件 - plugin.py (WebSocket版本)
+事件桥接器插件 - plugin.py (WebSocket版本 + 摄像头支持)
 
 功能：
 - 提供event_bus与WebSocket设备之间的双向消息转换
@@ -7,6 +7,7 @@
 - 接收WebSocket设备上报并发布为event_bus事件
 - 支持多设备路由
 - 自动心跳应答
+- 支持摄像头视频流传输（二进制帧）
 """
 
 import asyncio
@@ -14,16 +15,17 @@ import websockets
 import json
 import threading
 import time
+import struct
 import traceback
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Union
 from app.usv.plugin_base import Plugin, Response, PluginState
 from app.usv.event_bus import EventData, EventPriority
 
 
 class EventBridgePlugin(Plugin):
-    """事件桥接器插件 (WebSocket版本)"""
+    """事件桥接器插件 (WebSocket版本 + 摄像头支持)"""
 
-    VERSION = '1.0.0'
+    VERSION = '1.0.1'
     MIN_COMPATIBLE_VERSION = '1.0.0'
 
     def __init__(self, plugin_id: str, plugin_manager):
@@ -64,7 +66,11 @@ class EventBridgePlugin(Plugin):
         # 订阅者ID列表
         self._event_subscribers = []
 
-        self.log_info("事件桥接器插件初始化完成 (WebSocket)")
+        # 摄像头流管理
+        self._camera_streams: Dict[str, Dict[str, Any]] = {}  # {camera_id: {device, websocket, frame_count, ...}}
+        self._camera_lock = threading.Lock()
+
+        self.log_info("事件桥接器插件初始化完成 (WebSocket + 摄像头)")
 
     # ==================== 插件生命周期方法 ====================
 
@@ -211,6 +217,9 @@ class EventBridgePlugin(Plugin):
             with self._connection_lock:
                 self._clients.clear()
                 self._device_connections.clear()
+            
+            with self._camera_lock:
+                self._camera_streams.clear()
         except Exception as e:
             self.log_warning(f"清理连接时出错: {e}")
 
@@ -246,7 +255,8 @@ class EventBridgePlugin(Plugin):
                 '0.0.0.0', 
                 self._listen_port,
                 ping_interval=30,
-                ping_timeout=10
+                ping_timeout=10,
+                max_size=10 * 1024 * 1024  # 10MB，支持大帧
             ) as server:
                 self._ws_server = server
                 
@@ -458,9 +468,15 @@ class EventBridgePlugin(Plugin):
                 self._stats['errors'] += 1
             return False
     
-    async def _handle_uplink_message(self, data: str, websocket, current_device_name: Optional[str]) -> Optional[str]:
-        """处理上行消息"""
+    async def _handle_uplink_message(self, data: Union[str, bytes], websocket, 
+                                    current_device_name: Optional[str]) -> Optional[str]:
+        """处理上行消息（支持文本和二进制）"""
         try:
+            # 处理二进制数据（摄像头帧）
+            if isinstance(data, bytes):
+                return await self._handle_camera_frame(data, websocket, current_device_name)
+            
+            # 处理JSON文本消息（原有逻辑）
             with self._stats_lock:
                 self._stats['messages_received'] += 1
             
@@ -477,6 +493,7 @@ class EventBridgePlugin(Plugin):
                 self.log_info(f"设备 {source} 已注册连接")
                 current_device_name = source
             
+            # 处理不同类型的消息
             if msg_type == 'command_response':
                 self._handle_command_response(message, source)
             elif msg_type == 'device_status':
@@ -487,6 +504,12 @@ class EventBridgePlugin(Plugin):
                 self._handle_alert(message, source)
             elif msg_type == 'heartbeat_report':
                 await self._handle_heartbeat_report(message, source, websocket)
+            elif msg_type == 'camera_control_response':
+                self._handle_camera_control_response(message, source)
+            elif msg_type == 'camera_stream_started':
+                self._handle_camera_stream_started(message, source)
+            elif msg_type == 'camera_stream_stopped':
+                self._handle_camera_stream_stopped(message, source)
             else:
                 self.log_debug(f"未处理的上行消息类型: {msg_type} from {source}")
             
@@ -605,6 +628,137 @@ class EventBridgePlugin(Plugin):
         except Exception as e:
             self.log_error(f"发送心跳应答失败: {e}")
     
+    # ==================== 摄像头消息处理 ====================
+    
+    async def _handle_camera_frame(self, data: bytes, websocket, 
+                                   device_name: Optional[str]) -> Optional[str]:
+        """处理摄像头二进制帧数据
+        
+        帧格式：
+        [4字节:magic] [4字节:camera_id长度] [N字节:camera_id] 
+        [4字节:帧序号] [8字节:时间戳] [剩余:JPEG数据]
+        magic = 0x43414D46 (CAMF)
+        """
+        try:
+            if len(data) < 20:  # 最小头部长度
+                self.log_warning(f"摄像头帧数据过短: {len(data)} bytes")
+                return device_name
+            
+            # 解析头部
+            magic = struct.unpack('>I', data[0:4])[0]
+            
+            if magic != 0x43414D46:  # 'CAMF'
+                self.log_warning(f"无效的摄像头帧magic: {hex(magic)}")
+                return device_name
+            
+            camera_id_len = struct.unpack('>I', data[4:8])[0]
+            camera_id = data[8:8+camera_id_len].decode('utf-8')
+            
+            offset = 8 + camera_id_len
+            frame_seq = struct.unpack('>I', data[offset:offset+4])[0]
+            timestamp = struct.unpack('>d', data[offset+4:offset+12])[0]
+            jpeg_data = data[offset+12:]
+            
+            # 更新流信息
+            with self._camera_lock:
+                if camera_id not in self._camera_streams:
+                    self._camera_streams[camera_id] = {
+                        'device': device_name,
+                        'websocket': websocket,
+                        'frame_count': 0,
+                        'start_time': time.time()
+                    }
+                
+                stream_info = self._camera_streams[camera_id]
+                stream_info['frame_count'] += 1
+                stream_info['last_frame_time'] = timestamp
+                stream_info['last_frame_seq'] = frame_seq
+                stream_info['last_frame_size'] = len(jpeg_data)
+            
+            # 发布摄像头帧事件
+            self.publish_event(
+                event_type=f"camera.frame.{camera_id}",
+                data={
+                    "camera_id": camera_id,
+                    "device": device_name,
+                    "frame_seq": frame_seq,
+                    "timestamp": timestamp,
+                    "frame_size": len(jpeg_data),
+                    "jpeg_data": jpeg_data  # 二进制数据
+                },
+                priority=EventPriority.NORMAL
+            )
+            
+            self.log_debug(f"摄像头帧已接收: {camera_id} seq={frame_seq} size={len(jpeg_data)}")
+            
+            with self._stats_lock:
+                self._stats['messages_received'] += 1
+            
+            return device_name
+            
+        except Exception as e:
+            self.log_error(f"处理摄像头帧失败: {e}")
+            return device_name
+    
+    def _handle_camera_control_response(self, message: Dict, source: str):
+        """处理摄像头控制响应"""
+        camera_id = message.get('camera_id')
+        result = message.get('data', {})
+        
+        self.publish_event(
+            event_type="camera.control.result",
+            data={
+                "camera_id": camera_id,
+                "result": result,
+                "source": source
+            },
+            priority=EventPriority.HIGH
+        )
+        
+        self.log_info(f"摄像头控制响应: {camera_id} (source={source})")
+    
+    def _handle_camera_stream_started(self, message: Dict, source: str):
+        """处理摄像头流启动通知"""
+        camera_id = message.get('camera_id')
+        
+        with self._camera_lock:
+            if camera_id not in self._camera_streams:
+                self._camera_streams[camera_id] = {
+                    'device': source,
+                    'frame_count': 0,
+                    'start_time': time.time()
+                }
+        
+        self.publish_event(
+            event_type=f"camera.stream.started",
+            data={
+                "camera_id": camera_id,
+                "source": source
+            },
+            priority=EventPriority.NORMAL
+        )
+        
+        self.log_info(f"摄像头流已启动: {camera_id} (source={source})")
+    
+    def _handle_camera_stream_stopped(self, message: Dict, source: str):
+        """处理摄像头流停止通知"""
+        camera_id = message.get('camera_id')
+        
+        with self._camera_lock:
+            if camera_id in self._camera_streams:
+                del self._camera_streams[camera_id]
+        
+        self.publish_event(
+            event_type=f"camera.stream.stopped",
+            data={
+                "camera_id": camera_id,
+                "source": source
+            },
+            priority=EventPriority.NORMAL
+        )
+        
+        self.log_info(f"摄像头流已停止: {camera_id} (source={source})")
+    
     # ==================== 插件接口方法 ====================
     
     def get_bridge_status(self, input_data: Any = None) -> Dict[str, Any]:
@@ -616,6 +770,9 @@ class EventBridgePlugin(Plugin):
             connected_devices = list(self._device_connections.keys())
             client_count = len(self._clients)
         
+        with self._camera_lock:
+            camera_count = len(self._camera_streams)
+        
         uptime = time.time() - stats['start_time'] if stats['start_time'] > 0 else 0.0
         
         return {
@@ -624,6 +781,7 @@ class EventBridgePlugin(Plugin):
             'configured_devices': list(self._devices_config.keys()),
             'connected_devices': connected_devices,
             'client_count': client_count,
+            'camera_stream_count': camera_count,
             'statistics': {
                 'uptime': uptime,
                 'messages_sent': stats['messages_sent'],
@@ -693,6 +851,72 @@ class EventBridgePlugin(Plugin):
         except Exception as e:
             return {'success': False, 'message': str(e)}
     
+    def get_camera_streams(self, input_data: Any = None) -> Dict[str, Any]:
+        """获取当前所有摄像头流信息"""
+        with self._camera_lock:
+            streams = {}
+            current_time = time.time()
+            
+            for camera_id, info in self._camera_streams.items():
+                uptime = current_time - info.get('start_time', current_time)
+                fps = info.get('frame_count', 0) / uptime if uptime > 0 else 0
+                
+                streams[camera_id] = {
+                    'device': info.get('device'),
+                    'frame_count': info.get('frame_count', 0),
+                    'uptime': uptime,
+                    'fps': round(fps, 2),
+                    'last_frame_seq': info.get('last_frame_seq'),
+                    'last_frame_size': info.get('last_frame_size'),
+                    'last_frame_time': info.get('last_frame_time')
+                }
+        
+        return {
+            'success': True,
+            'stream_count': len(streams),
+            'streams': streams
+        }
+    
+    def stop_camera_stream(self, input_data: Any) -> Dict[str, Any]:
+        """停止指定摄像头流"""
+        if not isinstance(input_data, dict):
+            return {'success': False, 'message': '输入必须是字典格式'}
+        
+        camera_id = input_data.get('camera_id')
+        device_name = input_data.get('device_name', 'usb2xxx_1')
+        
+        if not camera_id:
+            return {'success': False, 'message': '缺少camera_id参数'}
+        
+        # 发送停止命令
+        command_msg = {
+            "type": "camera_control",
+            "camera_id": camera_id,
+            "action": "stop_stream",
+            "timestamp": time.time()
+        }
+        
+        with self._connection_lock:
+            websocket = self._device_connections.get(device_name)
+        
+        if not websocket:
+            return {'success': False, 'message': f'设备未连接: {device_name}'}
+        
+        try:
+            data = json.dumps(command_msg)
+            future = asyncio.run_coroutine_threadsafe(
+                websocket.send(data),
+                self._loop
+            )
+            future.result(timeout=5.0)
+            
+            return {
+                'success': True,
+                'message': f'停止命令已发送: {camera_id}'
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+    
     # ==================== 状态保存与恢复 ====================
     
     def _save_custom_state(self) -> Optional[Dict[str, Any]]:
@@ -703,9 +927,13 @@ class EventBridgePlugin(Plugin):
         with self._connection_lock:
             devices = list(self._device_connections.keys())
         
+        with self._camera_lock:
+            cameras = list(self._camera_streams.keys())
+        
         return {
             'statistics': stats,
             'connected_devices': devices,
+            'camera_streams': cameras,
             'event_subscribers': self._event_subscribers.copy()
         }
     
