@@ -256,12 +256,14 @@ class EventBridgePlugin(Plugin):
                     self.log_warning(f"关闭事件循环时出错: {e}")
 
     async def _start_server(self):
-        """启动WebSocket服务器（带路由功能）"""
+        """启动WebSocket服务器（带路由功能）- 修复版"""
         try:
             self.log_info(f"正在绑定 WebSocket 服务器到 0.0.0.0:{self._listen_port}...")
             
-            # 路由处理器
-            async def router(websocket, path):
+            # 修复：确保 router 函数正确定义
+            async def router(websocket):
+                # 从 websocket 对象获取路径
+                path = websocket.path
                 self.log_debug(f"新连接: {websocket.remote_address} -> {path}")
                 
                 if path == '/ingest_video':
@@ -272,6 +274,7 @@ class EventBridgePlugin(Plugin):
                     # 通用处理（向后兼容）
                     await self._handle_generic_client(websocket)
             
+            # 使用修复后的 router
             async with websockets.serve(
                 router,
                 '0.0.0.0', 
@@ -283,6 +286,9 @@ class EventBridgePlugin(Plugin):
                 self._ws_server = server
                 
                 self.log_info(f"✓ WebSocket 服务器成功绑定到端口 {self._listen_port}")
+                self.log_info("  - 视频流端点: /ingest_video")
+                self.log_info("  - 检测框端点: /ingest_boxes")
+                self.log_info("  - 通用端点: / (向后兼容)")
                 
                 self._server_ready.set()
                 
