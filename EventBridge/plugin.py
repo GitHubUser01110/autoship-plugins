@@ -424,7 +424,7 @@ class EventBridgePlugin(Plugin):
     # ==================== 消息处理方法 ====================
 
     async def _handle_detection_message(self, data: str, websocket, device_name: Optional[str]) -> Optional[str]:
-        """处理检测框JSON消息"""
+        """处理检测框JSON消息 - 修复版：转发给订阅者"""
         try:
             with self._stats_lock:
                 self._stats['messages_received'] += 1
@@ -441,7 +441,38 @@ class EventBridgePlugin(Plugin):
                         self._device_connections[device_name] = websocket
                     self.log_info(f"设备 {device_name} 已通过检测框连接注册")
 
-            # 发布检测事件
+            # 🔧 关键修改：转发检测框数据给订阅者
+            camera_id = message.get('camera_id')
+            if camera_id:
+                with self._frame_cache_lock:
+                    subscribers = self._frame_subscribers.get(camera_id, set()).copy()
+                
+                if subscribers:
+                    # 构建要转发的消息
+                    forward_msg = json.dumps({
+                        "type": "detection_data",
+                        "camera_id": camera_id,
+                        "frame_id": message.get('id'),
+                        "timestamp": message.get('ts'),
+                        "detections": message.get('det', []),
+                        "scale": message.get('scale', 1.0),
+                        "w": message.get('w'),
+                        "h": message.get('h')
+                    })
+                    
+                    # 转发给所有订阅者
+                    forward_count = 0
+                    for subscriber in subscribers:
+                        try:
+                            await subscriber.send(forward_msg)
+                            forward_count += 1
+                        except Exception as e:
+                            self.log_warning(f"转发检测框失败: {subscriber.remote_address} - {e}")
+                    
+                    if forward_count > 0:
+                        self.log_debug(f"检测框已转发给 {forward_count} 个订阅者 (camera: {camera_id})")
+
+            # 发布检测事件（保持原有逻辑）
             self.publish_event(
                 event_type="detection.boxes",
                 data={
