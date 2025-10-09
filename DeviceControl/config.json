@@ -1,5 +1,0 @@
-{
-    "target_device": "usb2xxx_1",
-    "command_timeout": 8.0,
-    "status_update_interval": 1.0
-}
