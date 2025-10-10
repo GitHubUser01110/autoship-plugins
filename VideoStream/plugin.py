@@ -64,6 +64,14 @@ class VideoFrameHandler:
             'active_subscribers': 0    # 活跃订阅者数
         }
         self.stats_lock = threading.Lock()
+
+        # 分片重组缓存
+        self._fragment_buffer: Dict[str, Dict[int, Dict[str, Any]]] = {}  # {camera_id: {frame_seq: {fragments}}}
+        self._fragment_lock = threading.Lock()
+        self._fragment_timeout = 2.0  # 分片超时时间（秒）
+        
+        # 启动分片清理线程
+        self._cleanup_thread: Optional[threading.Thread] = None
     
     async def add_frame(self, frame_data: bytes, camera_id: str, 
                        subscribers: Set[websockets.WebSocketServerProtocol]):
@@ -351,15 +359,23 @@ class VideoStreamPlugin(Plugin):
                 daemon=True
             )
             self._ws_thread.start()
+            
+            # 启动分片清理线程
+            self._cleanup_thread = threading.Thread(
+                target=self._run_fragment_cleanup,
+                name=f"{self.plugin_id}-fragment-cleanup",
+                daemon=True
+            )
+            self._cleanup_thread.start()
 
             # 等待WebSocket服务器就绪
             if not self._ws_ready.wait(timeout=10.0):
                 raise Exception("WebSocket服务器启动超时")
 
-            self.log_info(f"✓ UDP视频接收: 0.0.0.0:{self._udp_video_port}")
+            self.log_info(f"✓ UDP视频接收: 0.0.0.0:{self._udp_video_port} (支持分片)")
             self.log_info(f"✓ UDP检测框接收: 0.0.0.0:{self._udp_detection_port}")
             self.log_info(f"✓ WebSocket订阅服务: ws://0.0.0.0:{self._ws_port}")
-            self.log_info("  - 优化已启用: 异步发送 + 丢帧策略 + 流量控制")
+            self.log_info("  - 优化已启用: 分片传输 + 异步发送 + 丢帧策略 + 流量控制")
 
             with self._stats_lock:
                 self._stats['start_time'] = time.time()
@@ -372,7 +388,7 @@ class VideoStreamPlugin(Plugin):
                     'udp_detection_port': self._udp_detection_port,
                     'ws_port': self._ws_port,
                     'protocol': 'udp+websocket',
-                    'optimizations': ['async_send', 'frame_drop', 'rate_limit']
+                    'optimizations': ['fragmentation', 'async_send', 'frame_drop', 'rate_limit']
                 },
                 priority=EventPriority.NORMAL
             )
@@ -461,19 +477,19 @@ class VideoStreamPlugin(Plugin):
     # ==================== UDP接收器 ====================
 
     def _run_video_receiver(self):
-        """运行UDP视频帧接收器"""
+        """运行UDP视频帧接收器（支持分片重组）"""
         try:
             self._video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._video_socket.bind(('0.0.0.0', self._udp_video_port))
             self._video_socket.settimeout(1.0)
             
-            self.log_info(f"UDP视频接收器已启动: 0.0.0.0:{self._udp_video_port}")
+            self.log_info(f"UDP视频接收器已启动: 0.0.0.0:{self._udp_video_port} (支持分片重组)")
             
             while self._running.is_set():
                 try:
                     data, addr = self._video_socket.recvfrom(65535)
-                    self._handle_video_frame(data)
+                    self._handle_video_fragment(data)
                     
                 except socket.timeout:
                     continue
@@ -520,10 +536,23 @@ class VideoStreamPlugin(Plugin):
                 self._detection_socket.close()
             self.log_info("UDP检测框接收器已停止")
 
-    def _handle_video_frame(self, data: bytes):
-        """处理视频帧数据"""
+    def _handle_video_fragment(self, data: bytes):
+        """
+        处理视频分片数据
+        
+        分片协议格式：
+        - 魔数: 0x43414D46 (4字节) 'CAMF'
+        - 摄像头ID长度: (4字节)
+        - 摄像头ID: (变长)
+        - 帧序号: (4字节)
+        - 时间戳: (8字节 double)
+        - 分片索引: (4字节)
+        - 总分片数: (4字节)
+        - 分片数据长度: (4字节)
+        - 分片数据: (变长)
+        """
         try:
-            if len(data) < 20:
+            if len(data) < 32:  # 最小头部大小
                 return
             
             # 解析头部
@@ -532,12 +561,105 @@ class VideoStreamPlugin(Plugin):
                 return
             
             camera_id_len = struct.unpack('>I', data[4:8])[0]
+            if len(data) < 32 + camera_id_len:
+                return
+            
             camera_id = data[8:8+camera_id_len].decode('utf-8')
             
             offset = 8 + camera_id_len
             frame_seq = struct.unpack('>I', data[offset:offset+4])[0]
             timestamp = struct.unpack('>d', data[offset+4:offset+12])[0]
-            jpeg_data = data[offset+12:]
+            frag_idx = struct.unpack('>I', data[offset+12:offset+16])[0]
+            total_fragments = struct.unpack('>I', data[offset+16:offset+20])[0]
+            frag_len = struct.unpack('>I', data[offset+20:offset+24])[0]
+            
+            frag_data = data[offset+24:offset+24+frag_len]
+            
+            # 处理分片
+            with self._fragment_lock:
+                # 初始化摄像头缓存
+                if camera_id not in self._fragment_buffer:
+                    self._fragment_buffer[camera_id] = {}
+                
+                # 初始化帧缓存
+                if frame_seq not in self._fragment_buffer[camera_id]:
+                    self._fragment_buffer[camera_id][frame_seq] = {
+                        'fragments': {},
+                        'total_fragments': total_fragments,
+                        'timestamp': timestamp,
+                        'first_fragment_time': time.time()
+                    }
+                
+                frame_data = self._fragment_buffer[camera_id][frame_seq]
+                
+                # 存储分片
+                frame_data['fragments'][frag_idx] = frag_data
+                
+                # 检查是否收集齐所有分片
+                if len(frame_data['fragments']) == frame_data['total_fragments']:
+                    # 重组完整帧
+                    complete_frame = self._reassemble_frame(frame_data, camera_id, frame_seq)
+                    
+                    # 删除已处理的帧缓存
+                    del self._fragment_buffer[camera_id][frame_seq]
+                    
+                    # 处理完整帧
+                    if complete_frame:
+                        self._process_complete_frame(
+                            complete_frame,
+                            camera_id,
+                            frame_seq,
+                            timestamp
+                        )
+                        
+        except Exception as e:
+            self.log_error(f"处理视频分片失败: {e}\n{traceback.format_exc()}")
+    
+    def _reassemble_frame(self, frame_data: Dict, camera_id: str, frame_seq: int) -> Optional[bytes]:
+        """重组完整帧"""
+        try:
+            fragments = frame_data['fragments']
+            total_fragments = frame_data['total_fragments']
+            
+            # 按索引顺序重组
+            jpeg_parts = []
+            for i in range(total_fragments):
+                if i not in fragments:
+                    self.log_warning(f"缺失分片: {camera_id} 帧{frame_seq} 分片{i}/{total_fragments}")
+                    return None
+                jpeg_parts.append(fragments[i])
+            
+            # 合并所有分片
+            jpeg_data = b''.join(jpeg_parts)
+            
+            # 重建完整的帧数据包（与原格式兼容）
+            magic = 0x43414D46
+            camera_id_bytes = camera_id.encode('utf-8')
+            camera_id_len = len(camera_id_bytes)
+            timestamp = frame_data['timestamp']
+            
+            header = struct.pack(
+                f'>II{camera_id_len}sId',
+                magic,
+                camera_id_len,
+                camera_id_bytes,
+                frame_seq,
+                timestamp
+            )
+            
+            return header + jpeg_data
+            
+        except Exception as e:
+            self.log_error(f"重组帧失败: {e}\n{traceback.format_exc()}")
+            return None
+    
+    def _process_complete_frame(self, complete_data: bytes, camera_id: str, 
+                               frame_seq: int, timestamp: float):
+        """处理重组后的完整帧"""
+        try:
+            # 从完整数据中提取JPEG
+            offset = 8 + len(camera_id.encode('utf-8')) + 12  # header size
+            jpeg_data = complete_data[offset:]
             
             # 更新流信息
             with self._camera_lock:
@@ -555,13 +677,13 @@ class VideoStreamPlugin(Plugin):
             
             # 缓存最新帧
             with self._frame_cache_lock:
-                self._camera_frame_cache[camera_id] = data
+                self._camera_frame_cache[camera_id] = complete_data
                 subscribers = self._frame_subscribers.get(camera_id, set()).copy()
             
             # 使用VideoFrameHandler异步发送
             if subscribers and self._loop:
                 asyncio.run_coroutine_threadsafe(
-                    self._video_handler.add_frame(data, camera_id, subscribers),
+                    self._video_handler.add_frame(complete_data, camera_id, subscribers),
                     self._loop
                 )
             
@@ -582,7 +704,7 @@ class VideoStreamPlugin(Plugin):
                 self._stats['frames_received'] += 1
                     
         except Exception as e:
-            self.log_error(f"处理视频帧失败: {e}\n{traceback.format_exc()}")
+            self.log_error(f"处理完整帧失败: {e}\n{traceback.format_exc()}")
 
     def _handle_detection_data(self, data: str):
         """处理检测框数据"""
