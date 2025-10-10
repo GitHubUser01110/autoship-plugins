@@ -132,7 +132,7 @@ class VideoFrameHandler:
                     await asyncio.sleep(0.001)  # 1ms检查一次
                     
                     # 检测连接是否已关闭
-                    if subscriber.closed:
+                    if subscriber.close_code is not None:
                         raise ConnectionResetError("WebSocket已关闭")
                 
                 # 流量控制：限制发送速率
