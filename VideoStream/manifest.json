@@ -1,7 +1,7 @@
 {
     "id": "VideoStream",
     "name": "视频流插件 (UDP + WebSocket)",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "基于UDP接收视频流和检测框，通过WebSocket分发给订阅者",
     "author": "Ship Control Team",
     "entry": "plugin.py",

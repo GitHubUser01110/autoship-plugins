@@ -665,8 +665,7 @@ class VideoStreamPlugin(Plugin):
                 ping_interval=30,
                 ping_timeout=10,
                 max_size=10 * 1024 * 1024,
-                write_buffer_limit=5 * 1024 * 1024,
-                read_buffer_limit=5 * 1024 * 1024
+                write_limit=5 * 1024 * 1024
             ) as server:
                 self._ws_server = server
                 
