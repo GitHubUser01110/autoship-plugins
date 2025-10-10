@@ -260,7 +260,7 @@ class VideoStreamPlugin(Plugin):
 
         # 视频帧处理器（核心优化）
         self._video_handler = VideoFrameHandler(
-            target_fps=20,      # 目标发送帧率
+            target_fps=60,      # 目标发送帧率
             max_queue_size=1    # 队列只保留1帧
         )
 
