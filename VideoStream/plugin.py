@@ -1,14 +1,13 @@
 """
-视频流插件 - UDP版本 (视频流 + 检测框流 + 分片传输支持)
+视频流插件 - UDP版本 (视频流 + 分片传输支持 - 合并版)
 
 核心功能：
 1. ✅ UDP接收视频帧（支持大帧分片传输）
-2. ✅ UDP接收检测框数据
-3. ✅ 异步帧发送给订阅者（WebSocket）
-4. ✅ 帧队列管理（只保留最新1帧）
-5. ✅ 流量控制和丢帧策略
-6. ✅ 性能统计监控
-7. ✅ 分片自动重组和超时清理
+2. ✅ 异步帧发送给订阅者（WebSocket）
+3. ✅ 帧队列管理（只保留最新1帧）
+4. ✅ 流量控制和丢帧策略
+5. ✅ 性能统计监控
+6. ✅ 分片自动重组和超时清理
 """
 
 import asyncio
@@ -181,20 +180,18 @@ class VideoFrameHandler:
 # ==================== 视频流插件主类 ====================
 
 class VideoStreamPlugin(Plugin):
-    """视频流插件 (UDP接收 + WebSocket分发 + 分片支持)"""
+    """视频流插件 (UDP接收 + WebSocket分发 + 分片支持 - 合并版)"""
 
-    VERSION = '1.0.1'
-    MIN_COMPATIBLE_VERSION = '1.0.0'
+    VERSION = '1.1.0'
+    MIN_COMPATIBLE_VERSION = '1.1.0'
 
     def __init__(self, plugin_id: str, plugin_manager):
         super().__init__(plugin_id, plugin_manager)
 
         self._udp_video_port = 14000
-        self._udp_detection_port = 14001
         self._ws_port = 14002
 
         self._video_socket: Optional[socket.socket] = None
-        self._detection_socket: Optional[socket.socket] = None
         
         self._ws_server = None
         self._ws_clients: Set[websockets.WebSocketServerProtocol] = set()
@@ -203,9 +200,8 @@ class VideoStreamPlugin(Plugin):
         self._video_handler = VideoFrameHandler(target_fps=60, max_queue_size=1)
 
         self._video_thread: Optional[threading.Thread] = None
-        self._detection_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
-        self._cleanup_thread: Optional[threading.Thread] = None  # 分片清理线程
+        self._cleanup_thread: Optional[threading.Thread] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -227,26 +223,23 @@ class VideoStreamPlugin(Plugin):
 
         self._stats = {
             'frames_received': 0,
-            'detections_received': 0,
             'errors': 0,
             'start_time': 0.0
         }
         self._stats_lock = threading.Lock()
 
-        self.log_info("视频流插件初始化完成 (UDP接收 v1.0.1 - 支持分片)")
+        self.log_info("视频流插件初始化完成 (UDP接收 v1.1.0 - 支持分片 - 合并版)")
 
     def _handle_install(self) -> Response:
         self.log_info("正在安装视频流插件...")
         try:
             self._udp_video_port = int(self.get_config('udp_video_port', 14000))
-            self._udp_detection_port = int(self.get_config('udp_detection_port', 14001))
             self._ws_port = int(self.get_config('ws_port', 14002))
 
-            if not all(1024 <= p <= 65535 for p in [self._udp_video_port, self._udp_detection_port, self._ws_port]):
+            if not all(1024 <= p <= 65535 for p in [self._udp_video_port, self._ws_port]):
                 return Response(success=False, data="端口号必须在1024-65535范围内")
 
-            self.log_info(f"配置已加载: video_port={self._udp_video_port}, "
-                         f"detection_port={self._udp_detection_port}, ws_port={self._ws_port}")
+            self.log_info(f"配置已加载: video_port={self._udp_video_port}, ws_port={self._ws_port}")
             return Response(success=True, data="安装成功")
         except Exception as e:
             self.log_error(f"安装插件失败: {e}\n{traceback.format_exc()}")
@@ -265,13 +258,6 @@ class VideoStreamPlugin(Plugin):
             )
             self._video_thread.start()
 
-            self._detection_thread = threading.Thread(
-                target=self._run_detection_receiver,
-                name=f"{self.plugin_id}-detection-udp",
-                daemon=True
-            )
-            self._detection_thread.start()
-
             self._ws_thread = threading.Thread(
                 target=self._run_websocket_server,
                 name=f"{self.plugin_id}-ws-server",
@@ -289,8 +275,7 @@ class VideoStreamPlugin(Plugin):
             if not self._ws_ready.wait(timeout=10.0):
                 raise Exception("WebSocket服务器启动超时")
 
-            self.log_info(f"✓ UDP视频接收: 0.0.0.0:{self._udp_video_port} (支持分片)")
-            self.log_info(f"✓ UDP检测框接收: 0.0.0.0:{self._udp_detection_port}")
+            self.log_info(f"✓ UDP视频接收(带检测框): 0.0.0.0:{self._udp_video_port} (支持分片)")
             self.log_info(f"✓ WebSocket订阅服务: ws://0.0.0.0:{self._ws_port}")
             self.log_info("  - 优化已启用: 分片传输 + 异步发送 + 丢帧策略 + 流量控制")
 
@@ -302,7 +287,6 @@ class VideoStreamPlugin(Plugin):
                 data={
                     'plugin_id': self.plugin_id,
                     'udp_video_port': self._udp_video_port,
-                    'udp_detection_port': self._udp_detection_port,
                     'ws_port': self._ws_port,
                     'protocol': 'udp+websocket',
                     'optimizations': ['fragmentation', 'async_send', 'frame_drop', 'rate_limit']
@@ -326,12 +310,6 @@ class VideoStreamPlugin(Plugin):
                     self._video_socket.close()
                 except Exception as e:
                     self.log_warning(f"关闭视频UDP套接字时出错: {e}")
-            
-            if self._detection_socket:
-                try:
-                    self._detection_socket.close()
-                except Exception as e:
-                    self.log_warning(f"关闭检测框UDP套接字时出错: {e}")
 
             if self._loop and self._ws_server:
                 try:
@@ -343,7 +321,7 @@ class VideoStreamPlugin(Plugin):
                 except Exception as e:
                     self.log_warning(f"关闭WebSocket服务器时出错: {e}")
 
-            for thread in [self._video_thread, self._detection_thread, self._ws_thread, self._cleanup_thread]:
+            for thread in [self._video_thread, self._ws_thread, self._cleanup_thread]:
                 if thread and thread.is_alive():
                     thread.join(timeout=5.0)
 
@@ -439,34 +417,6 @@ class VideoStreamPlugin(Plugin):
             if self._video_socket:
                 self._video_socket.close()
             self.log_info("UDP视频接收器已停止")
-
-    def _run_detection_receiver(self):
-        """运行UDP检测框接收器"""
-        try:
-            self._detection_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._detection_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._detection_socket.bind(('0.0.0.0', self._udp_detection_port))
-            self._detection_socket.settimeout(1.0)
-            
-            self.log_info(f"UDP检测框接收器已启动: 0.0.0.0:{self._udp_detection_port}")
-            
-            while self._running.is_set():
-                try:
-                    data, addr = self._detection_socket.recvfrom(65535)
-                    self._handle_detection_data(data.decode('utf-8'))
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self._running.is_set():
-                        self.log_error(f"接收检测框错误: {e}")
-                        with self._stats_lock:
-                            self._stats['errors'] += 1
-        except Exception as e:
-            self.log_error(f"UDP检测框接收器错误: {e}\n{traceback.format_exc()}")
-        finally:
-            if self._detection_socket:
-                self._detection_socket.close()
-            self.log_info("UDP检测框接收器已停止")
 
     def _handle_video_fragment(self, data: bytes):
         """处理视频分片数据"""
@@ -597,56 +547,6 @@ class VideoStreamPlugin(Plugin):
                 self._stats['frames_received'] += 1
         except Exception as e:
             self.log_error(f"处理完整帧失败: {e}\n{traceback.format_exc()}")
-
-    def _handle_detection_data(self, data: str):
-        """处理检测框数据"""
-        try:
-            with self._stats_lock:
-                self._stats['detections_received'] += 1
-
-            message = json.loads(data)
-            camera_id = message.get('camera_id')
-            
-            if camera_id:
-                with self._frame_cache_lock:
-                    subscribers = self._frame_subscribers.get(camera_id, set()).copy()
-                
-                if subscribers and self._loop:
-                    forward_msg = json.dumps({
-                        "type": "detection_data",
-                        "camera_id": camera_id,
-                        "frame_id": message.get('id'),
-                        "timestamp": message.get('ts'),
-                        "detections": message.get('det', []),
-                        "scale": message.get('scale', 1.0),
-                        "w": message.get('w'),
-                        "h": message.get('h')
-                    })
-                    
-                    for subscriber in subscribers:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                subscriber.send(forward_msg),
-                                self._loop
-                            )
-                        except Exception as e:
-                            self.log_warning(f"转发检测框失败: {subscriber.remote_address} - {e}")
-
-            self.publish_event(
-                event_type="detection.boxes",
-                data={
-                    "camera_id": message.get('camera_id'),
-                    "detections": message.get('det', []),
-                    "frame_id": message.get('id'),
-                    "timestamp": message.get('ts'),
-                    "detection_count": len(message.get('det', []))
-                },
-                priority=EventPriority.NORMAL
-            )
-        except json.JSONDecodeError as e:
-            self.log_warning(f"检测框JSON解析失败: {e}")
-        except Exception as e:
-            self.log_error(f"处理检测框失败: {e}\n{traceback.format_exc()}")
 
     def _run_websocket_server(self):
         """运行WebSocket服务器"""
@@ -836,7 +736,6 @@ class VideoStreamPlugin(Plugin):
         return {
             'running': self._running.is_set(),
             'udp_video_port': self._udp_video_port,
-            'udp_detection_port': self._udp_detection_port,
             'ws_port': self._ws_port,
             'protocol': 'udp+websocket+fragmentation',
             'camera_stream_count': camera_count,
@@ -846,7 +745,6 @@ class VideoStreamPlugin(Plugin):
                 'uptime': uptime,
                 'frames_received': stats['frames_received'],
                 'frames_forwarded': video_handler_stats['frames_sent'],
-                'detections_received': stats['detections_received'],
                 'errors': stats['errors']
             },
             'video_handler_stats': video_handler_stats
@@ -877,7 +775,6 @@ class VideoStreamPlugin(Plugin):
                 'overall': {
                     'uptime_seconds': round(uptime, 2),
                     'frames_received': base_stats['frames_received'],
-                    'detections_received': base_stats['detections_received'],
                     'errors': base_stats['errors']
                 }
             },

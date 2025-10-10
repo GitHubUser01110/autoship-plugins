@@ -1,11 +1,11 @@
 {
     "id": "VideoStream",
-    "name": "视频流插件 (UDP + WebSocket)",
-    "version": "1.0.5",
-    "description": "基于UDP接收视频流和检测框，通过WebSocket分发给订阅者",
+    "name": "视频流插件 (UDP + WebSocket - 合并版)",
+    "version": "1.1.0",
+    "description": "基于UDP接收带检测框的视频流，通过WebSocket分发给订阅者（视频检测合并版）",
     "author": "Ship Control Team",
     "entry": "plugin.py",
-    "updated_at": "2025-10-10T00:00:00Z",
+    "updated_at": "2025-10-10T12:00:00Z",
     "dependencies": [],
     "config_schema": [
         {
@@ -14,16 +14,7 @@
             "default": 14000,
             "min": 10001,
             "max": 65535,
-            "description": "UDP视频流接收端口",
-            "required": true
-        },
-        {
-            "key": "udp_detection_port",
-            "type": "number",
-            "default": 14001,
-            "min": 10001,
-            "max": 65535,
-            "description": "UDP检测框接收端口",
+            "description": "UDP视频流接收端口（接收带检测框的视频）",
             "required": true
         },
         {
@@ -44,10 +35,11 @@
             "output_schema": {
                 "running": "boolean",
                 "udp_video_port": "number",
-                "udp_detection_port": "number",
                 "ws_port": "number",
+                "protocol": "string",
                 "camera_stream_count": "number",
                 "ws_client_count": "number",
+                "frame_subscriber_count": "number",
                 "statistics": "object",
                 "video_handler_stats": "object"
             }
@@ -98,7 +90,6 @@
     "events": {
         "publishes": [
             "camera.frame.**",
-            "detection.boxes",
             "videostream.started",
             "videostream.stopped"
         ],
