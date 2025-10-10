@@ -1,0 +1,11 @@
+{
+    "listen_port": 13000,
+    "devices": {
+        "usb2xxx_1": {
+            "description": "工控机1"
+        },
+        "usb2xxx_2": {
+            "description": "工控机2"
+        }
+    }
+}

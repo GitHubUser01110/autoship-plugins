@@ -1,12 +1,12 @@
 """
-事件桥接器插件 - plugin.py (WebSocket版本 + 摄像头支持 + 双连接架构)
+事件桥接器插件 - 优化版 (解决视频卡顿问题)
 
-架构改进：
-1. 双连接架构：/ingest_video（视频流）+ /ingest_boxes（检测框）
-2. 路径路由处理：根据WebSocket连接路径分发处理
-3. 连接类型分类：视频流连接、检测框连接、通用连接
-4. 专门的处理方法：针对不同数据类型优化处理逻辑
-5. 增强的统计和监控：分类统计不同类型连接的数据传输
+核心优化：
+1. ✅ 帧队列管理：每个订阅者只保留最新1帧
+2. ✅ 异步发送：独立协程发送，避免阻塞
+3. ✅ 流量控制：限制发送速率，防止缓冲区溢出
+4. ✅ 增大缓冲区：WebSocket写缓冲区扩大到5MB
+5. ✅ 统计监控：实时监控丢帧和发送性能
 """
 
 import asyncio
@@ -17,15 +17,226 @@ import time
 import struct
 import traceback
 from typing import Any, Dict, Optional, Set, Union
-from collections import defaultdict
+from collections import defaultdict, deque
 from app.usv.plugin_base import Plugin, Response, PluginState
 from app.usv.event_bus import EventData, EventPriority
 
 
-class EventBridgePlugin(Plugin):
-    """事件桥接器插件 (WebSocket版本 + 摄像头支持 + 双连接架构)"""
+# ==================== 新增：优化的视频帧处理器 ====================
 
-    VERSION = '1.1.0'
+class VideoFrameHandler:
+    """
+    视频帧处理器 - 核心优化组件
+    
+    功能：
+    - 每个订阅者维护独立的帧队列（只保留最新1帧）
+    - 异步发送协程（不阻塞接收）
+    - 流量控制（限制发送速率）
+    - 自动丢弃过期帧
+    """
+    
+    def __init__(self, target_fps: int = 20, max_queue_size: int = 1):
+        """
+        Args:
+            target_fps: 目标发送帧率（建议15-20）
+            max_queue_size: 每个订阅者的队列大小（建议1）
+        """
+        self.target_fps = target_fps
+        self.frame_interval = 1.0 / target_fps  # 帧间隔
+        self.max_queue_size = max_queue_size
+        
+        # 每个订阅者的帧队列（只保留最新帧）
+        self.frame_queues: Dict[websockets.WebSocketServerProtocol, deque] = {}
+        
+        # 发送任务管理
+        self.send_tasks: Dict[websockets.WebSocketServerProtocol, asyncio.Task] = {}
+        
+        # 统计信息
+        self.stats = {
+            'frames_received': 0,      # 接收到的总帧数
+            'frames_enqueued': 0,      # 成功入队的帧数
+            'frames_dropped': 0,       # 被丢弃的旧帧数
+            'frames_sent': 0,          # 成功发送的帧数
+            'frames_failed': 0,        # 发送失败的帧数
+            'total_bytes_sent': 0,     # 发送的总字节数
+            'active_subscribers': 0    # 活跃订阅者数
+        }
+        self.stats_lock = threading.Lock()
+    
+    async def add_frame(self, frame_data: bytes, camera_id: str, 
+                       subscribers: Set[websockets.WebSocketServerProtocol]):
+        """
+        添加新帧到订阅者队列
+        
+        关键优化：只保留最新帧，旧帧自动丢弃
+        """
+        with self.stats_lock:
+            self.stats['frames_received'] += 1
+        
+        for subscriber in subscribers:
+            try:
+                # 首次订阅：创建队列和发送任务
+                if subscriber not in self.frame_queues:
+                    self.frame_queues[subscriber] = deque(maxlen=self.max_queue_size)
+                    
+                    # 启动独立的发送协程
+                    task = asyncio.create_task(
+                        self._send_worker(subscriber, camera_id)
+                    )
+                    self.send_tasks[subscriber] = task
+                    
+                    with self.stats_lock:
+                        self.stats['active_subscribers'] += 1
+                
+                queue = self.frame_queues[subscriber]
+                
+                # 队列满时，旧帧会被自动丢弃（deque的maxlen特性）
+                if len(queue) >= self.max_queue_size:
+                    with self.stats_lock:
+                        self.stats['frames_dropped'] += 1
+                
+                # 入队新帧
+                queue.append({
+                    'data': frame_data,
+                    'timestamp': time.time(),
+                    'camera_id': camera_id
+                })
+                
+                with self.stats_lock:
+                    self.stats['frames_enqueued'] += 1
+                    
+            except Exception as e:
+                print(f"[VideoHandler] 添加帧失败: {subscriber.remote_address} - {e}")
+    
+    async def _send_worker(self, subscriber: websockets.WebSocketServerProtocol, 
+                          camera_id: str):
+        """
+        发送工作协程 - 每个订阅者一个独立协程
+        
+        关键优化：
+        - 非阻塞：不影响其他订阅者
+        - 流量控制：限制发送速率
+        - 只发最新帧：自动跳过过期帧
+        """
+        queue = self.frame_queues[subscriber]
+        last_send_time = 0
+        consecutive_failures = 0
+        MAX_FAILURES = 5  # 连续失败5次后断开
+        
+        try:
+            while True:
+                # 等待队列有数据
+                while len(queue) == 0:
+                    await asyncio.sleep(0.001)  # 1ms检查一次
+                    
+                    # 检测连接是否已关闭
+                    if subscriber.closed:
+                        raise ConnectionResetError("WebSocket已关闭")
+                
+                # 流量控制：限制发送速率
+                now = time.time()
+                elapsed = now - last_send_time
+                if elapsed < self.frame_interval:
+                    await asyncio.sleep(self.frame_interval - elapsed)
+                
+                # 只取最新帧，丢弃队列中的旧帧
+                frame_info = queue.pop()
+                queue.clear()  # 清空剩余旧帧
+                
+                frame_data = frame_info['data']
+                frame_age = time.time() - frame_info['timestamp']
+                
+                # 跳过过期帧（超过1秒）
+                if frame_age > 1.0:
+                    with self.stats_lock:
+                        self.stats['frames_dropped'] += 1
+                    continue
+                
+                # 发送帧
+                try:
+                    await subscriber.send(frame_data)
+                    
+                    with self.stats_lock:
+                        self.stats['frames_sent'] += 1
+                        self.stats['total_bytes_sent'] += len(frame_data)
+                    
+                    last_send_time = time.time()
+                    consecutive_failures = 0  # 重置失败计数
+                    
+                except Exception as e:
+                    consecutive_failures += 1
+                    
+                    with self.stats_lock:
+                        self.stats['frames_failed'] += 1
+                    
+                    print(f"[VideoHandler] 发送失败 [{consecutive_failures}/{MAX_FAILURES}]: "
+                          f"{subscriber.remote_address} - {e}")
+                    
+                    # 连续失败太多次，断开连接
+                    if consecutive_failures >= MAX_FAILURES:
+                        print(f"[VideoHandler] 连续失败过多，终止发送: {subscriber.remote_address}")
+                        break
+                    
+                    await asyncio.sleep(0.1)  # 失败后短暂延迟
+        
+        except (asyncio.CancelledError, ConnectionResetError) as e:
+            print(f"[VideoHandler] 发送任务已结束: {subscriber.remote_address} - {type(e).__name__}")
+        
+        except Exception as e:
+            print(f"[VideoHandler] 发送任务异常: {subscriber.remote_address}\n{traceback.format_exc()}")
+        
+        finally:
+            # 清理资源
+            await self._cleanup_subscriber(subscriber)
+    
+    async def _cleanup_subscriber(self, subscriber: websockets.WebSocketServerProtocol):
+        """清理订阅者资源"""
+        self.frame_queues.pop(subscriber, None)
+        self.send_tasks.pop(subscriber, None)
+        
+        with self.stats_lock:
+            self.stats['active_subscribers'] = len(self.frame_queues)
+        
+        print(f"[VideoHandler] 已清理订阅者: {subscriber.remote_address}")
+    
+    async def remove_subscriber(self, subscriber: websockets.WebSocketServerProtocol):
+        """主动移除订阅者"""
+        if subscriber in self.send_tasks:
+            task = self.send_tasks[subscriber]
+            task.cancel()
+            
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        with self.stats_lock:
+            stats = self.stats.copy()
+        
+        # 计算发送速率
+        if stats['frames_sent'] > 0:
+            stats['avg_frame_size'] = stats['total_bytes_sent'] / stats['frames_sent']
+        else:
+            stats['avg_frame_size'] = 0
+        
+        # 丢帧率
+        total_frames = stats['frames_received']
+        if total_frames > 0:
+            stats['drop_rate'] = stats['frames_dropped'] / total_frames * 100
+        else:
+            stats['drop_rate'] = 0.0
+        
+        return stats
+
+
+# ==================== 优化的插件主类 ====================
+
+class EventBridgePlugin(Plugin):
+    """事件桥接器插件 (优化版)"""
+
+    VERSION = '1.2.0'  # 版本号更新
     MIN_COMPATIBLE_VERSION = '1.0.0'
 
     def __init__(self, plugin_id: str, plugin_manager):
@@ -47,6 +258,12 @@ class EventBridgePlugin(Plugin):
         self._device_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._connection_lock = threading.Lock()
 
+        # 🔥 新增：视频帧处理器（核心优化）
+        self._video_handler = VideoFrameHandler(
+            target_fps=20,      # 目标发送帧率
+            max_queue_size=1    # 队列只保留1帧
+        )
+
         # 异步事件循环
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._server_thread: Optional[threading.Thread] = None
@@ -59,14 +276,14 @@ class EventBridgePlugin(Plugin):
         self._seq_counter = 0
         self._seq_lock = threading.Lock()
 
-        # 统计信息（增强版）
+        # 统计信息
         self._stats = {
             'messages_sent': 0,
             'messages_received': 0,
             'commands_forwarded': 0,
             'frames_forwarded': 0,
-            'frames_received': 0,  # 新增：接收的帧数
-            'detections_received': 0,  # 新增：接收的检测框消息数
+            'frames_received': 0,
+            'detections_received': 0,
             'errors': 0,
             'start_time': 0.0
         }
@@ -80,12 +297,12 @@ class EventBridgePlugin(Plugin):
         self._camera_lock = threading.Lock()
         
         # 帧缓存和订阅管理
-        self._camera_frame_cache: Dict[str, bytes] = {}  # {camera_id: latest_frame_data}
+        self._camera_frame_cache: Dict[str, bytes] = {}
         self._frame_subscribers: Dict[str, Set[websockets.WebSocketServerProtocol]] = defaultdict(set)
         self._subscriber_cameras: Dict[websockets.WebSocketServerProtocol, Set[str]] = defaultdict(set)
         self._frame_cache_lock = threading.Lock()
 
-        self.log_info("事件桥接器插件初始化完成 (双连接架构)")
+        self.log_info("事件桥接器插件初始化完成 (优化版 v1.2.0)")
 
     # ==================== 插件生命周期方法 ====================
 
@@ -130,7 +347,7 @@ class EventBridgePlugin(Plugin):
                 raise Exception("WebSocket服务器启动超时")
 
             self.log_info(f"✓ WebSocket服务器已启动: ws://0.0.0.0:{self._listen_port}")
-            self.log_info("  - 视频流端点: /ingest_video")
+            self.log_info("  - 视频流端点: /ingest_video (优化：异步发送 + 丢帧策略)")
             self.log_info("  - 检测框端点: /ingest_boxes")
             self.log_info("  - 通用端点: / (向后兼容)")
 
@@ -145,12 +362,13 @@ class EventBridgePlugin(Plugin):
                     'plugin_id': self.plugin_id,
                     'listen_port': self._listen_port,
                     'devices': list(self._devices_config.keys()),
-                    'endpoints': ['/ingest_video', '/ingest_boxes', '/']
+                    'endpoints': ['/ingest_video', '/ingest_boxes', '/'],
+                    'optimizations': ['async_send', 'frame_drop', 'rate_limit']
                 },
                 priority=EventPriority.NORMAL
             )
 
-            self.log_info("事件桥接器插件启用成功")
+            self.log_info("事件桥接器插件启用成功 (优化版)")
             return Response(success=True, data="启用成功")
 
         except Exception as e:
@@ -235,10 +453,10 @@ class EventBridgePlugin(Plugin):
         except Exception as e:
             self.log_warning(f"清理连接时出错: {e}")
 
-    # ==================== WebSocket服务器（双连接架构）====================
+    # ==================== WebSocket服务器 ====================
 
     def _run_websocket_server(self):
-        """运行WebSocket服务器（在独立线程中）"""
+        """运行WebSocket服务器"""
         try:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
@@ -256,13 +474,11 @@ class EventBridgePlugin(Plugin):
                     self.log_warning(f"关闭事件循环时出错: {e}")
 
     async def _start_server(self):
-        """启动WebSocket服务器（带路由功能）- 修复版"""
+        """启动WebSocket服务器 - 优化版"""
         try:
             self.log_info(f"正在绑定 WebSocket 服务器到 0.0.0.0:{self._listen_port}...")
             
-            # 修复：使用 websocket.request.path 获取路径
             async def router(websocket):
-                # 从 websocket.request 对象获取路径
                 path = websocket.request.path
                 self.log_debug(f"新连接: {websocket.remote_address} -> {path}")
                 
@@ -271,24 +487,23 @@ class EventBridgePlugin(Plugin):
                 elif path == '/ingest_boxes':
                     await self._handle_detection_boxes(websocket)
                 else:
-                    # 通用处理（向后兼容）
                     await self._handle_generic_client(websocket)
             
-            # 使用修复后的 router
+            # 🔥 优化：增大缓冲区
             async with websockets.serve(
                 router,
                 '0.0.0.0', 
                 self._listen_port,
                 ping_interval=30,
                 ping_timeout=10,
-                max_size=10 * 1024 * 1024
+                max_size=10 * 1024 * 1024,              # 10MB最大消息
+                write_buffer_limit=5 * 1024 * 1024,     # 🔥 5MB写缓冲（关键优化）
+                read_buffer_limit=5 * 1024 * 1024       # 🔥 5MB读缓冲
             ) as server:
                 self._ws_server = server
                 
                 self.log_info(f"✓ WebSocket 服务器成功绑定到端口 {self._listen_port}")
-                self.log_info("  - 视频流端点: /ingest_video")
-                self.log_info("  - 检测框端点: /ingest_boxes")
-                self.log_info("  - 通用端点: / (向后兼容)")
+                self.log_info("  - 优化已启用: 异步发送 + 丢帧策略 + 大缓冲区")
                 
                 self._server_ready.set()
                 
@@ -319,10 +534,10 @@ class EventBridgePlugin(Plugin):
             self._ws_server.close()
             await self._ws_server.wait_closed()
 
-    # ==================== 专门的连接处理器 ====================
+    # ==================== 连接处理器 ====================
 
     async def _handle_video_stream(self, websocket):
-        """专门处理视频流连接 (/ingest_video)"""
+        """处理视频流连接"""
         client_addr = websocket.remote_address
         self.log_info(f"视频流客户端连接: {client_addr}")
 
@@ -335,10 +550,8 @@ class EventBridgePlugin(Plugin):
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
-                    # 处理二进制视频帧
-                    device_name = await self._handle_camera_frame(message, websocket, device_name)
+                    device_name = await self._handle_camera_frame_optimized(message, websocket, device_name)
                 elif isinstance(message, str):
-                    # 处理JSON消息（如心跳、设备注册等）
                     device_name = await self._handle_text_message(message, websocket, device_name)
 
         except websockets.exceptions.ConnectionClosed:
@@ -349,7 +562,7 @@ class EventBridgePlugin(Plugin):
             await self._cleanup_client_connection(websocket, device_name, 'video')
 
     async def _handle_detection_boxes(self, websocket):
-        """专门处理检测框连接 (/ingest_boxes)"""
+        """处理检测框连接"""
         client_addr = websocket.remote_address
         self.log_info(f"检测框客户端连接: {client_addr}")
 
@@ -362,7 +575,6 @@ class EventBridgePlugin(Plugin):
         try:
             async for message in websocket:
                 if isinstance(message, str):
-                    # 处理检测框JSON消息
                     device_name = await self._handle_detection_message(message, websocket, device_name)
                 else:
                     self.log_warning(f"检测框连接收到非文本消息: {type(message)}")
@@ -375,7 +587,7 @@ class EventBridgePlugin(Plugin):
             await self._cleanup_client_connection(websocket, device_name, 'detection')
 
     async def _handle_generic_client(self, websocket):
-        """处理通用客户端连接（向后兼容）"""
+        """处理通用客户端连接"""
         client_addr = websocket.remote_address
         self.log_info(f"通用客户端连接: {client_addr}")
 
@@ -388,10 +600,8 @@ class EventBridgePlugin(Plugin):
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
-                    # 处理二进制数据（摄像头帧）
-                    device_name = await self._handle_camera_frame(message, websocket, device_name)
+                    device_name = await self._handle_camera_frame_optimized(message, websocket, device_name)
                 elif isinstance(message, str):
-                    # 处理文本消息
                     device_name = await self._handle_uplink_message(message, websocket, device_name)
 
         except websockets.exceptions.ConnectionClosed:
@@ -418,13 +628,94 @@ class EventBridgePlugin(Plugin):
                     del self._device_connections[device_name]
                     self.log_warning(f"设备 {device_name} 已断开连接 (类型: {connection_type})")
         
+        # 🔥 清理视频处理器中的订阅者
+        await self._video_handler.remove_subscriber(websocket)
+        
         # 清理订阅
         await self._cleanup_subscriber(websocket)
 
-    # ==================== 消息处理方法 ====================
+    # ==================== 🔥 优化的摄像头帧处理 ====================
+
+    async def _handle_camera_frame_optimized(self, data: bytes, websocket, 
+                                            device_name: Optional[str]) -> Optional[str]:
+        """
+        处理摄像头二进制帧 - 优化版
+        
+        关键改进：使用VideoFrameHandler异步发送，避免阻塞
+        """
+        try:
+            if len(data) < 20:
+                self.log_warning(f"摄像头帧数据过短: {len(data)} bytes")
+                return device_name
+            
+            # 解析头部
+            magic = struct.unpack('>I', data[0:4])[0]
+            
+            if magic != 0x43414D46:  # 'CAMF'
+                self.log_warning(f"无效的摄像头帧magic: {hex(magic)}")
+                return device_name
+            
+            camera_id_len = struct.unpack('>I', data[4:8])[0]
+            camera_id = data[8:8+camera_id_len].decode('utf-8')
+            
+            offset = 8 + camera_id_len
+            frame_seq = struct.unpack('>I', data[offset:offset+4])[0]
+            timestamp = struct.unpack('>d', data[offset+4:offset+12])[0]
+            jpeg_data = data[offset+12:]
+            
+            # 更新流信息
+            with self._camera_lock:
+                if camera_id not in self._camera_streams:
+                    self._camera_streams[camera_id] = {
+                        'device': device_name,
+                        'websocket': websocket,
+                        'frame_count': 0,
+                        'start_time': time.time()
+                    }
+                
+                stream_info = self._camera_streams[camera_id]
+                stream_info['frame_count'] += 1
+                stream_info['last_frame_time'] = timestamp
+                stream_info['last_frame_seq'] = frame_seq
+                stream_info['last_frame_size'] = len(jpeg_data)
+            
+            # 缓存最新帧
+            with self._frame_cache_lock:
+                self._camera_frame_cache[camera_id] = data
+                subscribers = self._frame_subscribers.get(camera_id, set()).copy()
+            
+            # 🔥 关键优化：使用VideoFrameHandler异步发送
+            if subscribers:
+                await self._video_handler.add_frame(data, camera_id, subscribers)
+            
+            # 发布事件
+            self.publish_event(
+                event_type=f"camera.frame.{camera_id}",
+                data={
+                    "camera_id": camera_id,
+                    "device": device_name,
+                    "frame_seq": frame_seq,
+                    "timestamp": timestamp,
+                    "frame_size": len(jpeg_data),
+                    "subscriber_count": len(subscribers) if subscribers else 0
+                },
+                priority=EventPriority.NORMAL
+            )
+            
+            with self._stats_lock:
+                self._stats['messages_received'] += 1
+                self._stats['frames_received'] += 1
+            
+            return device_name
+            
+        except Exception as e:
+            self.log_error(f"处理摄像头帧失败: {e}\n{traceback.format_exc()}")
+            return device_name
+
+    # ==================== 其他消息处理（保持不变）====================
 
     async def _handle_detection_message(self, data: str, websocket, device_name: Optional[str]) -> Optional[str]:
-        """处理检测框JSON消息 - 修复版：转发给订阅者"""
+        """处理检测框JSON消息"""
         try:
             with self._stats_lock:
                 self._stats['messages_received'] += 1
@@ -432,7 +723,6 @@ class EventBridgePlugin(Plugin):
 
             message = json.loads(data)
             
-            # 检测设备注册
             if not device_name:
                 inferred_device = message.get('device_name') or message.get('source')
                 if inferred_device:
@@ -441,14 +731,12 @@ class EventBridgePlugin(Plugin):
                         self._device_connections[device_name] = websocket
                     self.log_info(f"设备 {device_name} 已通过检测框连接注册")
 
-            # 🔧 关键修改：转发检测框数据给订阅者
             camera_id = message.get('camera_id')
             if camera_id:
                 with self._frame_cache_lock:
                     subscribers = self._frame_subscribers.get(camera_id, set()).copy()
                 
                 if subscribers:
-                    # 构建要转发的消息
                     forward_msg = json.dumps({
                         "type": "detection_data",
                         "camera_id": camera_id,
@@ -460,7 +748,6 @@ class EventBridgePlugin(Plugin):
                         "h": message.get('h')
                     })
                     
-                    # 转发给所有订阅者
                     forward_count = 0
                     for subscriber in subscribers:
                         try:
@@ -472,7 +759,6 @@ class EventBridgePlugin(Plugin):
                     if forward_count > 0:
                         self.log_debug(f"检测框已转发给 {forward_count} 个订阅者 (camera: {camera_id})")
 
-            # 发布检测事件（保持原有逻辑）
             self.publish_event(
                 event_type="detection.boxes",
                 data={
@@ -516,14 +802,12 @@ class EventBridgePlugin(Plugin):
 
             self.log_debug(f"收到文本消息: {msg_type} from {websocket.remote_address} (source={source})")
 
-            # 设备注册处理
             if source != 'unknown' and source != device_name:
                 with self._connection_lock:
                     self._device_connections[source] = websocket
                 self.log_info(f"设备 {source} 已注册连接")
                 device_name = source
 
-            # 消息类型处理
             if msg_type == 'heartbeat_report':
                 await self._handle_heartbeat_report(message, source, websocket)
             elif msg_type == 'subscribe_camera':
@@ -535,7 +819,6 @@ class EventBridgePlugin(Plugin):
                 if camera_id:
                     await self._unsubscribe_camera_stream(websocket, camera_id)
             else:
-                # 其他消息类型转发到通用处理器
                 device_name = await self._handle_uplink_message(data, websocket, device_name)
 
             return device_name
@@ -561,20 +844,25 @@ class EventBridgePlugin(Plugin):
         
         self.log_info(f"客户端订阅摄像头流: {camera_id} ({websocket.remote_address})")
         
-        # 发送订阅确认
         ack_msg = {
             "type": "subscribe_ack",
             "camera_id": camera_id,
             "status": "success",
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "optimization": "async_send_enabled"  # 通知客户端优化已启用
         }
         
         try:
             await websocket.send(json.dumps(ack_msg))
             
-            # 如果有缓存的最新帧，立即发送
             if camera_id in self._camera_frame_cache:
-                await websocket.send(self._camera_frame_cache[camera_id])
+                # 🔥 使用优化的发送方式
+                subscribers = {websocket}
+                await self._video_handler.add_frame(
+                    self._camera_frame_cache[camera_id],
+                    camera_id,
+                    subscribers
+                )
                 self.log_debug(f"发送缓存帧给新订阅者: {camera_id}")
                 
         except Exception as e:
@@ -593,9 +881,11 @@ class EventBridgePlugin(Plugin):
                 if not self._subscriber_cameras[websocket]:
                     del self._subscriber_cameras[websocket]
         
+        # 🔥 清理视频处理器
+        await self._video_handler.remove_subscriber(websocket)
+        
         self.log_info(f"客户端取消订阅摄像头流: {camera_id} ({websocket.remote_address})")
         
-        # 发送取消订阅确认
         ack_msg = {
             "type": "unsubscribe_ack",
             "camera_id": camera_id,
@@ -611,17 +901,14 @@ class EventBridgePlugin(Plugin):
     async def _cleanup_subscriber(self, websocket):
         """清理订阅者"""
         with self._frame_cache_lock:
-            # 获取该客户端订阅的所有摄像头
             subscribed_cameras = self._subscriber_cameras.get(websocket, set()).copy()
             
-            # 从所有订阅中移除该客户端
             for camera_id in subscribed_cameras:
                 if camera_id in self._frame_subscribers:
                     self._frame_subscribers[camera_id].discard(websocket)
                     if not self._frame_subscribers[camera_id]:
                         del self._frame_subscribers[camera_id]
             
-            # 移除客户端记录
             if websocket in self._subscriber_cameras:
                 del self._subscriber_cameras[websocket]
         
@@ -629,7 +916,7 @@ class EventBridgePlugin(Plugin):
             self.log_info(f"清理订阅者: {websocket.remote_address}, 订阅的摄像头: {subscribed_cameras}")
 
     # ==================== 事件订阅 ====================
-
+    
     def _subscribe_command_events(self):
         """订阅设备命令事件"""
         result = self.subscribe_event(
@@ -1090,7 +1377,7 @@ class EventBridgePlugin(Plugin):
         
         self.log_info(f"摄像头流已停止: {camera_id} (source={source})")
     
-    # ==================== 插件接口方法（增强版）====================
+    # ==================== 🔥 增强的插件接口方法 ====================
     
     def get_bridge_status(self, input_data: Any = None) -> Dict[str, Any]:
         """获取桥接器状态（增强版）"""
@@ -1112,6 +1399,9 @@ class EventBridgePlugin(Plugin):
         
         uptime = time.time() - stats['start_time'] if stats['start_time'] > 0 else 0.0
         
+        # 🔥 获取视频处理器统计
+        video_handler_stats = self._video_handler.get_stats()
+        
         return {
             'running': self._running.is_set(),
             'listen_port': self._listen_port,
@@ -1126,17 +1416,87 @@ class EventBridgePlugin(Plugin):
             'camera_stream_count': camera_count,
             'frame_subscriber_count': subscriber_count,
             'endpoints': ['/ingest_video', '/ingest_boxes', '/'],
+            'optimizations': {
+                'enabled': ['async_send', 'frame_drop', 'rate_limit', 'large_buffer'],
+                'target_fps': self._video_handler.target_fps,
+                'max_queue_size': self._video_handler.max_queue_size
+            },
             'statistics': {
                 'uptime': uptime,
                 'messages_sent': stats['messages_sent'],
                 'messages_received': stats['messages_received'],
                 'commands_forwarded': stats['commands_forwarded'],
                 'frames_received': stats['frames_received'],
-                'frames_forwarded': stats['frames_forwarded'],
+                'frames_forwarded': video_handler_stats['frames_sent'],  # 🔥 从handler获取
                 'detections_received': stats['detections_received'],
                 'errors': stats['errors']
-            }
+            },
+            'video_handler_stats': video_handler_stats  # 🔥 详细的视频处理统计
         }
+    
+    def get_performance_report(self, input_data: Any = None) -> Dict[str, Any]:
+        """🔥 新增：获取性能报告"""
+        video_stats = self._video_handler.get_stats()
+        
+        with self._stats_lock:
+            base_stats = self._stats.copy()
+        
+        uptime = time.time() - base_stats['start_time'] if base_stats['start_time'] > 0 else 1.0
+        
+        return {
+            'success': True,
+            'performance': {
+                'video_processing': {
+                    'frames_received': video_stats['frames_received'],
+                    'frames_sent': video_stats['frames_sent'],
+                    'frames_dropped': video_stats['frames_dropped'],
+                    'frames_failed': video_stats['frames_failed'],
+                    'drop_rate_percent': round(video_stats['drop_rate'], 2),
+                    'avg_frame_size_kb': round(video_stats['avg_frame_size'] / 1024, 2),
+                    'throughput_mbps': round(video_stats['total_bytes_sent'] / uptime / 1024 / 1024 * 8, 2),
+                    'active_subscribers': video_stats['active_subscribers']
+                },
+                'overall': {
+                    'uptime_seconds': round(uptime, 2),
+                    'messages_received': base_stats['messages_received'],
+                    'messages_sent': base_stats['messages_sent'],
+                    'commands_forwarded': base_stats['commands_forwarded'],
+                    'detections_received': base_stats['detections_received'],
+                    'errors': base_stats['errors']
+                }
+            },
+            'recommendations': self._get_performance_recommendations(video_stats)
+        }
+    
+    def _get_performance_recommendations(self, video_stats: Dict) -> list:
+        """生成性能优化建议"""
+        recommendations = []
+        
+        if video_stats['drop_rate'] > 30:
+            recommendations.append({
+                'level': 'warning',
+                'message': f"丢帧率较高 ({video_stats['drop_rate']:.1f}%)，建议降低发送端帧率或质量"
+            })
+        
+        if video_stats['frames_failed'] > video_stats['frames_sent'] * 0.1:
+            recommendations.append({
+                'level': 'error',
+                'message': "发送失败率高，检查网络连接或客户端处理速度"
+            })
+        
+        if video_stats['avg_frame_size'] > 100 * 1024:  # 100KB
+            recommendations.append({
+                'level': 'info',
+                'message': f"平均帧大小较大 ({video_stats['avg_frame_size']/1024:.1f}KB)，考虑降低JPEG质量"
+            })
+        
+        if not recommendations:
+            recommendations.append({
+                'level': 'success',
+                'message': "性能良好，无需优化"
+            })
+        
+        return recommendations
     
     def get_latest_frame(self, input_data: Any) -> Dict[str, Any]:
         """获取最新帧（用于快照）"""

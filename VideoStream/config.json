@@ -1,0 +1,5 @@
+{
+    "udp_video_port": 14000,
+    "udp_detection_port": 14001,
+    "ws_port": 14002
+}

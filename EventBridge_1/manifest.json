@@ -1,11 +1,11 @@
 {
-    "id": "EventBridge",
-    "name": "事件桥接器插件 (WebSocket + 摄像头)",
-    "version": "1.1.4",
-    "description": "基于WebSocket的双向事件桥接器，支持设备控制和摄像头视频流传输",
+    "id": "EventBridge_1",
+    "name": "事件桥接器插件 (WebSocket指令流)",
+    "version": "2.0.0",
+    "description": "基于WebSocket的双向指令流桥接器，专用于设备控制命令通信",
     "author": "Ship Control Team",
     "entry": "plugin.py",
-    "updated_at": "2025-10-08T00:00:00Z",
+    "updated_at": "2025-10-10T00:00:00Z",
     "dependencies": [],
     "config_schema": [
         {
@@ -14,7 +14,7 @@
             "default": 13000,
             "min": 10001,
             "max": 65535,
-            "description": "WebSocket监听端口",
+            "description": "WebSocket监听端口（指令流）",
             "required": true
         },
         {
@@ -32,14 +32,13 @@
     "interfaces": [
         {
             "name": "get_bridge_status",
-            "description": "获取桥接器状态（包括摄像头流统计）",
+            "description": "获取桥接器状态",
             "input_schema": {},
             "output_schema": {
                 "running": "boolean",
                 "listen_port": "number",
                 "connected_devices": "array",
                 "client_count": "number",
-                "camera_stream_count": "number",
                 "statistics": "object"
             }
         },
@@ -65,28 +64,6 @@
                 "success": "boolean",
                 "message": "string"
             }
-        },
-        {
-            "name": "get_camera_streams",
-            "description": "获取所有摄像头流信息",
-            "input_schema": {},
-            "output_schema": {
-                "success": "boolean",
-                "stream_count": "number",
-                "streams": "object"
-            }
-        },
-        {
-            "name": "stop_camera_stream",
-            "description": "停止指定摄像头流",
-            "input_schema": {
-                "camera_id": "string",
-                "device_name": "string"
-            },
-            "output_schema": {
-                "success": "boolean",
-                "message": "string"
-            }
         }
     ],
     "events": {
@@ -97,12 +74,7 @@
             "alert.**",
             "system.heartbeat",
             "bridge.started",
-            "bridge.stopped",
-            "bridge.error",
-            "camera.frame.**",
-            "camera.stream.started",
-            "camera.stream.stopped",
-            "camera.control.result"
+            "bridge.stopped"
         ],
         "subscribes": [
             "device.command.**"
